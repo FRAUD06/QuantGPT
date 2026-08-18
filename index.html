@@ -706,19 +706,21 @@ body.focusMode #main{padding:8px}
       <button class="small ghost" id="aiSettingsToggle">⚙ Settings</button>
     </div>
     <div id="aiSettingsPane" style="display:none">
-      <div style="font-size:11px;color:var(--dim);margin-bottom:8px;line-height:1.5">
-        Bring your own Claude API key. It is stored only in this browser's local storage and sent
-        directly from your browser to Anthropic's API — never to us or anyone else. Anyone with
-        access to this browser profile can read it back out, so don't paste a key here on a shared machine.
-        <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener" style="color:var(--accent)">Get a key</a>
+      <div class="row"><label>Provider</label>
+        <select id="aiProvider" style="width:190px">
+          <option value="claude">Claude (Anthropic)</option>
+          <option value="gemini">Gemini (Google) — free tier</option>
+        </select>
+      </div>
+      <div style="font-size:11px;color:var(--dim);margin:8px 0;line-height:1.5">
+        Bring your own API key. It is stored only in this browser's local storage and sent directly
+        from your browser to the provider's API — never to us or anyone else. Anyone with access to
+        this browser profile can read it back out, so don't paste a key here on a shared machine.
+        <span id="aiKeyNote"></span> <a id="aiGetKeyLink" href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener" style="color:var(--accent)">Get a key</a>
       </div>
       <div class="row"><label>API key</label><input type="password" id="aiApiKey" placeholder="sk-ant-..." style="width:190px"></div>
       <div class="row"><label>Model</label>
-        <select id="aiModel" style="width:190px">
-          <option value="claude-opus-5">Opus 5 (smartest)</option>
-          <option value="claude-sonnet-5" selected>Sonnet 5 (balanced)</option>
-          <option value="claude-haiku-4-5">Haiku 4.5 (fastest)</option>
-        </select>
+        <select id="aiModel" style="width:190px"></select>
       </div>
       <div style="display:flex;gap:6px;margin-top:6px">
         <button class="small" id="aiSaveKey" style="flex:1">Save</button>
@@ -4332,14 +4334,24 @@ window.addEventListener("resize",()=>{ if(CH.bars) requestDraw(); });
 
 /* ============================================================
    AI ASSISTANT PANEL — "Quant GPT"
-   Client-side-only chat against the user's own Claude API key (stored in
-   localStorage, sent directly from the browser to api.anthropic.com — this
-   file has no backend). Uses tool use so the model can actually call the
-   app's own backtest engine (via doRun/loadAsset) instead of guessing, the
-   same way an assistant with real tool access would work through this app.
-   Tool results are deliberately aggregated stats only (net PnL, profit
-   factor, etc) — never raw bars or full trade rows — so the chat path can't
-   be used to exfiltrate the embedded dataset.
+   Client-side-only chat against the user's own API key for either Claude
+   (Anthropic) or Gemini (Google) -- provider picked in Settings, key stored
+   in localStorage, sent directly from the browser to the provider's own API
+   (this file has no backend). Gemini exists specifically because Claude/
+   OpenAI both require a prepaid/credit-card-backed account before any call
+   works at all; Gemini's free tier needs only a Google account, so it's the
+   accessible default for anyone without existing API credits.
+   aiMessages is kept in Claude's own content-block shape as the canonical
+   internal format regardless of which provider is active -- aiCallGemini()
+   translates it to/from Gemini's contents/functionCall/functionResponse
+   shape at the edges (see aiMessagesToGeminiContents), so aiAgentLoop below
+   never needs to know which provider actually ran.
+   Uses tool use so the model can actually call the app's own backtest
+   engine (via doRun/loadAsset) instead of guessing, the same way an
+   assistant with real tool access would work through this app. Tool
+   results are deliberately aggregated stats only (net PnL, profit factor,
+   etc) — never raw bars or full trade rows — so the chat path can't be
+   used to exfiltrate the embedded dataset.
    ============================================================ */
 const AI_TOOLS=[
   {
@@ -4379,8 +4391,31 @@ const AI_SYSTEM_PROMPT="You are Quant GPT, an assistant embedded directly in a f
   "Be concise and quantitative. Flag when a result rests on a small sample (rule of thumb: well under ~30 trades is not statistically meaningful). Note that this engine mirrors TradingView's fill model but is not TradingView — treat results as structure-testing, not penny-exact. "+
   "You cannot see or return raw price bars or full trade-by-trade logs, only aggregated stats — say so if asked for raw data.";
 
-function aiLoadSettings(){ try{ return JSON.parse(localStorage.getItem("aiSettings")||"{}"); }catch(e){ return {}; } }
+// per-provider settings, since a Claude key and a Gemini key are never interchangeable --
+// switching the provider dropdown must never clobber the other provider's saved key.
+// shape: {provider, claude:{apiKey,model}, gemini:{apiKey,model}}
+const AI_MODELS_BY_PROVIDER = {
+  claude: [
+    {value:"claude-opus-5", label:"Opus 5 (smartest)"},
+    {value:"claude-sonnet-5", label:"Sonnet 5 (balanced)"},
+    {value:"claude-haiku-4-5", label:"Haiku 4.5 (fastest)"}
+  ],
+  gemini: [
+    {value:"gemini-2.5-pro", label:"2.5 Pro (smartest, 5 req/min free)"},
+    {value:"gemini-2.5-flash", label:"2.5 Flash (balanced, 10 req/min free)"},
+    {value:"gemini-2.5-flash-lite", label:"2.5 Flash-Lite (fastest, 15 req/min free)"}
+  ]
+};
+const AI_DEFAULT_MODEL = {claude:"claude-sonnet-5", gemini:"gemini-2.5-flash"};
+function aiLoadSettings(){
+  try{ const s=JSON.parse(localStorage.getItem("aiSettings")||"{}"); return {provider:"claude", claude:{}, gemini:{}, ...s}; }
+  catch(e){ return {provider:"claude", claude:{}, gemini:{}}; }
+}
 function aiSaveSettings(s){ try{ localStorage.setItem("aiSettings", JSON.stringify(s)); }catch(e){} }
+function aiCurrentProviderSettings(){
+  const s=aiLoadSettings();
+  return {provider:s.provider||"claude", ...(s[s.provider||"claude"]||{})};
+}
 
 let aiMessages=[], aiBusy=false;
 
@@ -4507,39 +4542,104 @@ async function aiExecuteTool(name,input){
   return {error:"unknown tool "+name};
 }
 
+// Claude call -- returns Claude's own content-block array unchanged (that's the canonical
+// shape aiMessages/the agent loop are built around).
+async function aiCallClaude(settings){
+  let resp;
+  try{
+    resp=await fetch("https://api.anthropic.com/v1/messages",{
+      method:"POST",
+      headers:{
+        "content-type":"application/json",
+        "x-api-key":settings.apiKey,
+        "anthropic-version":"2023-06-01",
+        "anthropic-dangerous-direct-browser-access":"true"
+      },
+      body:JSON.stringify({
+        model: settings.model||AI_DEFAULT_MODEL.claude,
+        max_tokens: 2048,
+        system: AI_SYSTEM_PROMPT,
+        tools: AI_TOOLS,
+        messages: aiMessages
+      })
+    });
+  }catch(e){ throw new Error("Network error talking to Anthropic's API: "+e.message); }
+  if(!resp.ok){
+    let msg="API error "+resp.status;
+    try{ const j=await resp.json(); if(j&&j.error&&j.error.message) msg+=": "+j.error.message; }catch(e){}
+    throw new Error(msg);
+  }
+  const data=await resp.json();
+  return data.content||[];
+}
+
+// translate the canonical (Claude-shaped) aiMessages history into Gemini's contents array.
+// tool_result blocks only carry tool_use_id, not the tool's name (Gemini's functionResponse
+// needs the name) -- resolve it from whichever earlier tool_use block shares that id, scanned
+// up front so this never touches/risks the Claude-shaped objects themselves.
+function aiMessagesToGeminiContents(messages){
+  const nameById={};
+  for(const m of messages) for(const b of (Array.isArray(m.content)?m.content:[]))
+    if(b.type==="tool_use") nameById[b.id]=b.name;
+  const contents=[];
+  for(const m of messages){
+    const role = m.role==="assistant" ? "model" : "user";
+    const parts=[];
+    const blocks = typeof m.content==="string" ? [{type:"text",text:m.content}] : (m.content||[]);
+    for(const b of blocks){
+      if(b.type==="text") parts.push({text:b.text});
+      else if(b.type==="tool_use") parts.push({functionCall:{name:b.name, args:b.input||{}, id:b.id}});
+      else if(b.type==="tool_result"){
+        let responseObj; try{ responseObj=JSON.parse(b.content); }catch(e){ responseObj={result:b.content}; }
+        parts.push({functionResponse:{name:nameById[b.tool_use_id]||"unknown", id:b.tool_use_id, response:responseObj}});
+      }
+    }
+    if(parts.length) contents.push({role,parts});
+  }
+  return contents;
+}
+// Gemini call -- normalizes the response BACK into Claude-shaped content blocks (text /
+// tool_use) so the rest of the agent loop below never needs to know which provider ran.
+async function aiCallGemini(settings){
+  const model = settings.model||AI_DEFAULT_MODEL.gemini;
+  const url = "https://generativelanguage.googleapis.com/v1beta/models/"+encodeURIComponent(model)+
+    ":generateContent?key="+encodeURIComponent(settings.apiKey);
+  let resp;
+  try{
+    resp=await fetch(url,{
+      method:"POST",
+      headers:{"content-type":"application/json"},
+      body:JSON.stringify({
+        contents: aiMessagesToGeminiContents(aiMessages),
+        systemInstruction: {parts:[{text:AI_SYSTEM_PROMPT}]},
+        tools: [{functionDeclarations: AI_TOOLS.map(t=>({name:t.name, description:t.description, parameters:t.input_schema}))}]
+      })
+    });
+  }catch(e){ throw new Error("Network error talking to Google's API: "+e.message); }
+  if(!resp.ok){
+    let msg="API error "+resp.status;
+    try{ const j=await resp.json(); if(j&&j.error&&j.error.message) msg+=": "+j.error.message; }catch(e){}
+    throw new Error(msg);
+  }
+  const data=await resp.json();
+  const parts=((data.candidates||[])[0]||{}).content&&data.candidates[0].content.parts||[];
+  return parts.map(p=>{
+    if(p.text!=null) return {type:"text", text:p.text};
+    if(p.functionCall) return {type:"tool_use", id:p.functionCall.id||("call_"+Math.random().toString(36).slice(2)), name:p.functionCall.name, input:p.functionCall.args||{}};
+    return null;
+  }).filter(Boolean);
+}
+
 async function aiAgentLoop(settings){
   for(let iter=0; iter<8; iter++){
-    let resp;
+    let content;
     try{
-      resp=await fetch("https://api.anthropic.com/v1/messages",{
-        method:"POST",
-        headers:{
-          "content-type":"application/json",
-          "x-api-key":settings.apiKey,
-          "anthropic-version":"2023-06-01",
-          "anthropic-dangerous-direct-browser-access":"true"
-        },
-        body:JSON.stringify({
-          model: settings.model||"claude-sonnet-5",
-          max_tokens: 2048,
-          system: AI_SYSTEM_PROMPT,
-          tools: AI_TOOLS,
-          messages: aiMessages
-        })
-      });
-    }catch(e){
-      aiAppendMsg("sys","Network error talking to Anthropic's API: "+e.message); return;
-    }
-    if(!resp.ok){
-      let msg="API error "+resp.status;
-      try{ const j=await resp.json(); if(j&&j.error&&j.error.message) msg+=": "+j.error.message; }catch(e){}
-      aiAppendMsg("sys",msg); return;
-    }
-    const data=await resp.json();
-    aiMessages.push({role:"assistant",content:data.content});
-    const textBlocks=(data.content||[]).filter(b=>b.type==="text").map(b=>b.text).join("\n").trim();
+      content = settings.provider==="gemini" ? await aiCallGemini(settings) : await aiCallClaude(settings);
+    }catch(e){ aiAppendMsg("sys", e.message); return; }
+    aiMessages.push({role:"assistant",content});
+    const textBlocks=content.filter(b=>b.type==="text").map(b=>b.text).join("\n").trim();
     if(textBlocks) aiAppendMsg("assistant",textBlocks);
-    const toolUses=(data.content||[]).filter(b=>b.type==="tool_use");
+    const toolUses=content.filter(b=>b.type==="tool_use");
     if(!toolUses.length) return;
     const results=[];
     for(const tu of toolUses){
@@ -4558,9 +4658,9 @@ async function aiSend(){
   if(aiBusy) return;
   const input=$("aiInput"); const text=input.value.trim();
   if(!text) return;
-  const settings=aiLoadSettings();
+  const settings=aiCurrentProviderSettings();
   if(!settings.apiKey){
-    aiAppendMsg("sys","Add your Claude API key in Settings first.");
+    aiAppendMsg("sys","Add your "+(settings.provider==="gemini"?"Gemini":"Claude")+" API key in Settings first.");
     $("aiSettingsPane").style.display="";
     return;
   }
@@ -4583,18 +4683,47 @@ $("aiToggleTab").onclick=()=>{
   try{ if(localStorage.getItem("aiPanelOpen")==="1"){ $("aiPanel").classList.remove("collapsed"); $("aiToggleTab").textContent="▶"; } }catch(e){}
 })();
 $("aiSettingsToggle").onclick=()=>{ const s=$("aiSettingsPane"); s.style.display=s.style.display==="none"?"":"none"; };
+
+const AI_KEY_LINKS = {
+  claude: {href:"https://console.anthropic.com/settings/keys", note:"Requires a prepaid/credit-card-backed account.", placeholder:"sk-ant-..."},
+  gemini: {href:"https://aistudio.google.com/apikey", note:"Free tier, no credit card needed.", placeholder:"AIza..."}
+};
+function aiRefreshProviderUI(){
+  const provider=$("aiProvider").value;
+  const modelSel=$("aiModel");
+  modelSel.innerHTML = AI_MODELS_BY_PROVIDER[provider].map(m=>'<option value="'+m.value+'">'+m.label+'</option>').join("");
+  const link=AI_KEY_LINKS[provider];
+  $("aiGetKeyLink").href=link.href;
+  $("aiKeyNote").textContent=link.note;
+  $("aiApiKey").placeholder=link.placeholder;
+  const s=aiLoadSettings();
+  const saved=s[provider]||{};
+  $("aiApiKey").value=saved.apiKey||"";
+  modelSel.value=saved.model||AI_DEFAULT_MODEL[provider];
+  $("aiKeyStatus").textContent="";
+}
+$("aiProvider").addEventListener("change",()=>{
+  const s=aiLoadSettings(); s.provider=$("aiProvider").value; aiSaveSettings(s);
+  aiRefreshProviderUI();
+});
 (function(){
   const s=aiLoadSettings();
-  if(s.apiKey) $("aiApiKey").value=s.apiKey;
-  if(s.model) $("aiModel").value=s.model;
+  $("aiProvider").value=s.provider||"claude";
+  aiRefreshProviderUI();
 })();
 $("aiSaveKey").onclick=()=>{
+  const provider=$("aiProvider").value;
   const apiKey=$("aiApiKey").value.trim(), model=$("aiModel").value;
-  aiSaveSettings({apiKey,model});
+  const s=aiLoadSettings(); s.provider=provider; s[provider]={apiKey,model};
+  aiSaveSettings(s);
   $("aiKeyStatus").innerHTML=apiKey?'<span class="pos">Saved — stored only in this browser.</span>':"Cleared.";
 };
 $("aiClearKey").onclick=()=>{
-  $("aiApiKey").value=""; aiSaveSettings({}); $("aiKeyStatus").textContent="Cleared.";
+  const provider=$("aiProvider").value;
+  $("aiApiKey").value="";
+  const s=aiLoadSettings(); s[provider]={};
+  aiSaveSettings(s);
+  $("aiKeyStatus").textContent="Cleared.";
 };
 $("aiSendBtn").onclick=aiSend;
 $("aiInput").addEventListener("keydown",e=>{ if((e.metaKey||e.ctrlKey)&&e.key==="Enter"){ e.preventDefault(); aiSend(); } });
