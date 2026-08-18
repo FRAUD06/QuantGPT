@@ -161,6 +161,33 @@ body.focusMode #main{padding:8px}
        d. Take the form's own URL (ends in "/viewform"), swap "/viewform" for
           "/formResponse", paste into EMAIL_LIST_FORM_URL below.
      Leave both blank to skip collecting emails entirely.
+  5. SIGN-UP: a "Don't have an account? Sign up" link on the login card, for
+     people who aren't in the Gist's `users` list. AUTO-APPROVES on submit --
+     free tool right now, no reason to make people wait on manual review.
+     Every signup still gets logged to a Google Sheet (same no-backend
+     pattern as #4) purely so you have a running list of users -- that list
+     is NOT what grants access, it's just visibility for you (and the seed
+     for real subscription gating later: a Sheet row triggering a Zapier/
+     Apps-Script action, or eventually a proper backend). If SIGNUP_FORM_URL
+     is left blank, signup still works (access is still granted), it just
+     silently skips logging -- so set it up if you actually want the list.
+     SETUP (one-time, mirrors #4 above but 2 fields instead of 1):
+       a. forms.google.com -> Blank form -> add exactly 2 questions, both
+          Short answer: "Email" and "Requested password".
+       b. Responses tab -> green Sheets icon -> create a linked sheet -- that
+          sheet is your user list.
+       c. Vertical-dots menu -> "Get pre-filled link" -> distinct throwaway
+          values in each field (e.g. "SIGNUPEMAIL" / "SIGNUPPASS") -> Get
+          link -> copy it, match each entry.NNNNNN to SIGNUP_FORM_FIELDS
+          below.
+       d. Form's "/viewform" URL -> swap for "/formResponse" -> paste into
+          SIGNUP_FORM_URL below.
+     TO REVOKE someone (self-signed-up or in `users`), add their email to a
+     "revoked" array in the SAME access.json Gist, e.g.:
+       { "expires": "...", "users": [...], "revoked": ["x@y.com"] }
+     Checked on every page load (kicks out anyone already logged in within
+     one load) and blocks that email from signing up again. No code change
+     needed -- just edit the Gist.
   ============================================================================ -->
 <script>
   var GATE_CONFIG_URL = "https://gist.githubusercontent.com/FRAUD06/ceca79b86f3da83ce60ef39a7d83033f/raw/access.json"; // <-- paste your Gist's raw access.json URL here (see setup notes above)
@@ -168,6 +195,8 @@ body.focusMode #main{padding:8px}
   var GATE_FALLBACK_EXPIRES = "2026-08-29"; // <-- fallback passcode stops working after this date (YYYY-MM-DD), even for people already using it. Set "" to disable.
   var EMAIL_LIST_FORM_URL = "";         // <-- your email-capture form's ".../formResponse" URL (step d)
   var EMAIL_LIST_FORM_FIELD = "";       // <-- entry.NNNNNN id for the Email question (step c)
+  var SIGNUP_FORM_URL = "";             // <-- your signup-request form's ".../formResponse" URL (step d above)
+  var SIGNUP_FORM_FIELDS = { email: "", password: "" }; // <-- entry.NNNNNN ids from step c above
 </script>
 <div id="gateOverlay" class="gateOverlay">
   <div class="gateCard">
@@ -178,6 +207,21 @@ body.focusMode #main{padding:8px}
       <input type="password" id="gatePass" placeholder="Password" autocomplete="current-password" style="display:none">
       <button id="gateSubmit" style="display:none">Log in</button>
       <div id="gateErr" style="color:var(--red);font-size:12px;margin-top:8px;display:none"></div>
+      <div id="gateToSignup" style="display:none;margin-top:10px;font-size:12px;color:var(--dim);text-align:center">
+        Don't have an account? <span id="gateSignupLink" style="color:var(--accent);cursor:pointer;text-decoration:underline">Sign up</span>
+      </div>
+    </div>
+    <div id="signupBody" style="display:none">
+      <div class="sub" style="margin-bottom:0">Free to use right now -- pick an email and password and you're in.</div>
+      <input type="email" id="suEmail" placeholder="Email" autocomplete="username">
+      <input type="password" id="suPass" placeholder="Choose a password" autocomplete="new-password">
+      <input type="password" id="suPass2" placeholder="Confirm password" autocomplete="new-password">
+      <button id="suSubmit">Sign up</button>
+      <div id="suErr" style="color:var(--red);font-size:12px;margin-top:8px;display:none"></div>
+      <div id="suStatus" style="font-size:12px;margin-top:8px;display:none"></div>
+      <div style="margin-top:10px;font-size:12px;color:var(--dim);text-align:center">
+        <span id="gateToLoginLink" style="color:var(--accent);cursor:pointer;text-decoration:underline">Back to log in</span>
+      </div>
     </div>
   </div>
 </div>
@@ -194,12 +238,17 @@ body.focusMode #main{padding:8px}
   function showForm(msg){
     sub.textContent = msg || "Enter your email and password to continue.";
     emailEl.style.display=""; passEl.style.display=""; btn.style.display="";
+    document.getElementById("gateToSignup").style.display="";
   }
   function showExpired(){
     document.getElementById("gateBody").innerHTML = '<div class="sub" style="margin-bottom:0">This preview link has expired.</div>';
   }
-  function unlock(email, pass, isNewLogin){
-    try{ localStorage.setItem("gateSession", JSON.stringify({email:email, password:pass})); }catch(e){}
+  function isRevoked(cfgObj, email){
+    if(!cfgObj || !email) return false;
+    return (cfgObj.revoked||[]).some(function(r){ return (r||"").trim().toLowerCase()===email; });
+  }
+  function unlock(email, pass, isNewLogin, selfSignup){
+    try{ localStorage.setItem("gateSession", JSON.stringify({email:email, password:pass, selfSignup:!!selfSignup})); }catch(e){}
     gate.style.display = "none";
     if(isNewLogin && email && EMAIL_LIST_FORM_URL && EMAIL_LIST_FORM_FIELD){
       var body = new URLSearchParams();
@@ -207,6 +256,56 @@ body.focusMode #main{padding:8px}
       fetch(EMAIL_LIST_FORM_URL, {method:"POST", mode:"no-cors", body:body}).catch(function(){});
     }
   }
+
+  // sign-up panel -- toggles the login form for a separate email+password capture.
+  // AUTO-APPROVES: unlocks immediately on submit, no manual Gist edit needed (this
+  // tool is free right now, so there's no reason to gate on Farhan reviewing every
+  // signup). Still logs every signup to a Google Sheet (SIGNUP_FORM_URL, see setup
+  // notes above the gate HTML) purely so there's a running list of users -- that
+  // list is NOT what grants access. To cut someone off later, add their email to a
+  // "revoked" array in the SAME access.json Gist (e.g. "revoked": ["x@y.com"]) --
+  // checked on every page load (see stillValid below) and blocks new signups with
+  // that email too. Lives in the same IIFE so it can reuse `gate`/`cfg`/`unlock`
+  // without polluting the global scope with another auth-adjacent closure.
+  (function(){
+    var signupLink=document.getElementById("gateSignupLink");
+    var loginLink=document.getElementById("gateToLoginLink");
+    var gateBody=document.getElementById("gateBody");
+    var signupBody=document.getElementById("signupBody");
+    var suEmail=document.getElementById("suEmail"), suPass=document.getElementById("suPass"), suPass2=document.getElementById("suPass2");
+    var suSubmit=document.getElementById("suSubmit"), suErr=document.getElementById("suErr"), suStatus=document.getElementById("suStatus");
+
+    signupLink.onclick=function(){
+      gateBody.style.display="none"; signupBody.style.display="block";
+      suErr.style.display="none"; suStatus.style.display="none";
+      suEmail.focus();
+    };
+    loginLink.onclick=function(){
+      signupBody.style.display="none"; gateBody.style.display="";
+    };
+
+    function submitSignup(){
+      suErr.style.display="none"; suStatus.style.display="none";
+      var email=(suEmail.value||"").trim().toLowerCase();
+      var pass=suPass.value||"", pass2=suPass2.value||"";
+      if(!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)){ suErr.textContent="Enter a valid email."; suErr.style.display="block"; return; }
+      if(!pass){ suErr.textContent="Choose a password."; suErr.style.display="block"; return; }
+      if(pass!==pass2){ suErr.textContent="Passwords don't match."; suErr.style.display="block"; return; }
+      if(isRevoked(cfg, email)){ suErr.textContent="This email doesn't have access."; suErr.style.display="block"; return; }
+      if(SIGNUP_FORM_URL && SIGNUP_FORM_FIELDS.email){
+        var body=new URLSearchParams();
+        body.append(SIGNUP_FORM_FIELDS.email, email);
+        if(SIGNUP_FORM_FIELDS.password) body.append(SIGNUP_FORM_FIELDS.password, pass);
+        fetch(SIGNUP_FORM_URL, {method:"POST", mode:"no-cors", body:body}).catch(function(){});
+      } else {
+        console.warn("SIGNUP_FORM_URL not configured -- signup logging skipped (access was still granted).");
+      }
+      unlock(email, pass, true, true);
+    }
+    suSubmit.onclick=submitSignup;
+    suPass2.addEventListener("keydown", function(e){ if(e.key==="Enter") submitSignup(); });
+  })();
+
   function tryLogin(){
     err.style.display = "none";
     var email = (emailEl.value||"").trim().toLowerCase();
@@ -216,6 +315,7 @@ body.focusMode #main{padding:8px}
       err.textContent = "Wrong password."; err.style.display = "block"; return;
     }
     if(!cfg){ err.textContent = "Still checking access -- try again in a moment."; err.style.display = "block"; return; }
+    if(isRevoked(cfg, email)){ err.textContent = "This email doesn't have access."; err.style.display = "block"; return; }
     var match = (cfg.users||[]).some(function(u){ return (u.email||"").trim().toLowerCase()===email && u.password===pass; });
     if(match){ unlock(email, pass, true); return; }
     err.textContent = "Email or password not recognized."; err.style.display = "block";
@@ -245,8 +345,13 @@ body.focusMode #main{padding:8px}
       cfg = j;
       var expired = j.expires && new Date() > new Date(j.expires+"T23:59:59Z");
       if(expired){ showExpired(); return; }
+      if(saved && isRevoked(j, saved.email)){
+        try{ localStorage.removeItem("gateSession"); }catch(e){}
+        showForm("This email doesn't have access anymore.");
+        return;
+      }
       var users = j.users||[];
-      var stillValid = saved && users.some(function(u){ return (u.email||"").trim().toLowerCase()===saved.email && u.password===saved.password; });
+      var stillValid = saved && (saved.selfSignup || users.some(function(u){ return (u.email||"").trim().toLowerCase()===saved.email && u.password===saved.password; }));
       if(stillValid){ gate.style.display = "none"; return; }
       try{ localStorage.removeItem("gateSession"); }catch(e){}
       showForm();
