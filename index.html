@@ -4193,12 +4193,17 @@ function varRenderResults(mode,results){
     "<tr><td style='color:var(--dim)'>Worst-case max DD</td><td style='text-align:right'>$"+pct(dds,0.95).toFixed(0)+"</td></tr>"+
     "</table>";
 }
-function runVarianceTest(){
+async function runVarianceTest(){
   if(!DATA){ $("varianceStatus").textContent="Load data first."; return; }
   const id=$("stratSel").value;
   if(id==="anq"||!PINE_STRATS[id]){ $("varianceStatus").textContent="Paste/select a Pine strategy first."; return; }
   const comp=getComp(id);
   if(!comp.step||comp.errors.length){ $("varianceStatus").textContent="Strategy has errors — reopen the paste box."; return; }
+  // pre-fetch any cross-symbol request.security() data ONCE before the (potentially
+  // hundreds-of-runs) simulation loop below -- cached on comp._reqCache, so this is a
+  // no-op after the first call and costs nothing for scripts that don't use it at all
+  try{ await resolveRequestSecurityData(comp); }
+  catch(e){ $("varianceStatus").textContent="Failed: "+e.message; return; }
   const P=collectParams();
   const sim={pointValue:+$("pointValue").value||2, minTick:+$("minTick").value||0.25,
     commission:+$("commission").value||0, slippage:+$("slippage").value||0,
