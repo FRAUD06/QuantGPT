@@ -580,6 +580,25 @@ body.focusMode #main{padding:8px}
     </div>
   </details>
 
+  <details class="group" id="ddFreqGroup">
+    <summary>Drawdown frequency</summary>
+    <div class="body">
+      <div style="font-size:11px;color:var(--dim);margin-bottom:8px;line-height:1.4">
+        Max DD alone hides how OFTEN you'd actually be near a limit. Set up to 5 thresholds
+        (e.g. your prop firm's max/trailing DD) and see how many separate drawdown episodes
+        reached each depth, and how often that happens per year. Edit any threshold, or set it
+        to 0 to skip it.
+      </div>
+      <div class="row"><label>Enable</label><input type="checkbox" id="ddFreqEnabled"></div>
+      <div class="row"><label>Threshold 1 $</label><input type="number" id="ddFreqT1" value="1000" step="100"></div>
+      <div class="row"><label>Threshold 2 $</label><input type="number" id="ddFreqT2" value="1500" step="100"></div>
+      <div class="row"><label>Threshold 3 $</label><input type="number" id="ddFreqT3" value="2000" step="100"></div>
+      <div class="row"><label>Threshold 4 $</label><input type="number" id="ddFreqT4" value="2500" step="100"></div>
+      <div class="row"><label>Threshold 5 $</label><input type="number" id="ddFreqT5" value="3000" step="100"></div>
+      <div id="ddFreqResults" style="margin-top:8px"></div>
+    </div>
+  </details>
+
   <details class="group" id="varianceGroup">
     <summary>Robustness testing</summary>
     <div class="body">
@@ -2760,7 +2779,68 @@ function renderResults(res,sim,bars,iStart,iEnd,ms){
   renderTradeTable(pos);
   $("btnExportTrades").disabled=pos.length===0;
   runDiscVal();
+  renderDDFrequency(res,sim,bars,iStart,iEnd,days);
 }
+
+/* ============================================================
+   DRAWDOWN FREQUENCY — max DD alone hides how OFTEN you'd actually be
+   near a limit. Walks the equity series once, tracking distinct
+   peak->trough->recovery episodes (an episode starts the moment equity
+   first dips below its running peak, ends the moment it makes a NEW
+   peak; its depth is the worst point reached anywhere in between), then
+   buckets those episodes against up to 5 user-set thresholds. Computed
+   for both close-based equity and intrabar worst-case (peak tracked off
+   the FAVORABLE side of each bar, trough off the ADVERSE side) --
+   same close-vs-intrabar distinction used everywhere else in this panel.
+   ============================================================ */
+function ddEpisodesClose(equity,iStart,iEnd){
+  const episodes=[]; let peak=-Infinity, inEp=false, curDepth=0;
+  for(let i=iStart;i<=iEnd;i++){
+    const e=equity[i]; if(e===undefined||!isFinite(e)) continue;
+    if(e>peak){ if(inEp){episodes.push(curDepth); inEp=false;} peak=e; }
+    else{ const depth=peak-e; if(depth>0){ if(!inEp){inEp=true;curDepth=depth;} else curDepth=Math.max(curDepth,depth); } }
+  }
+  if(inEp) episodes.push(curDepth);
+  return episodes;
+}
+function ddEpisodesHL(equityBest,equityWorst,iStart,iEnd){
+  const episodes=[]; let peak=-Infinity, inEp=false, curDepth=0;
+  for(let i=iStart;i<=iEnd;i++){
+    const b=equityBest[i], w=equityWorst[i]; if(!isFinite(w)) continue;
+    if(isFinite(b)) peak=Math.max(peak,b);
+    const depth=peak-w;
+    if(depth>0){ if(!inEp){inEp=true;curDepth=depth;} else curDepth=Math.max(curDepth,depth); }
+    else if(inEp){ episodes.push(curDepth); inEp=false; }
+  }
+  if(inEp) episodes.push(curDepth);
+  return episodes;
+}
+function renderDDFrequency(res,sim,bars,iStart,iEnd,days){
+  const host=$("ddFreqResults"); if(!host) return;
+  if(!$("ddFreqEnabled").checked){ host.innerHTML=""; return; }
+  const years=days/365;
+  const closeEps=ddEpisodesClose(res.equity,iStart,iEnd);
+  const hlEps=(res.equityBest&&res.equityWorst)?ddEpisodesHL(res.equityBest,res.equityWorst,iStart,iEnd):[];
+  const thresholds=[1,2,3,4,5].map(n=>+$("ddFreqT"+n).value).filter(v=>v>0).sort((a,b)=>a-b);
+  let rows="<tr><td></td><td style='text-align:right;color:var(--dim)'>Close-based</td><td style='text-align:right;color:var(--dim)'>Intrabar worst</td></tr>";
+  for(const th of thresholds){
+    const c=closeEps.filter(d=>d>=th).length, h=hlEps.filter(d=>d>=th).length;
+    const cRate=years>0?(c/years).toFixed(1):"0", hRate=years>0?(h/years).toFixed(1):"0";
+    rows+="<tr><td style='color:var(--dim)'>&ge; $"+th.toLocaleString()+"</td>"+
+      "<td style='text-align:right'>"+c+" ("+cRate+"/yr)</td>"+
+      "<td style='text-align:right'>"+h+" ("+hRate+"/yr)</td></tr>";
+  }
+  const maxClose=closeEps.length?Math.max(...closeEps):0, maxHl=hlEps.length?Math.max(...hlEps):0;
+  host.innerHTML="<table style='width:100%;font-size:11.5px;border-collapse:collapse'>"+rows+"</table>"+
+    "<div style='font-size:11px;color:var(--dim);margin-top:6px'>"+closeEps.length+" close-based / "+hlEps.length+" intrabar drawdown episodes total over "+years.toFixed(1)+"yr &middot; max depth $"+maxClose.toLocaleString()+" (close) / $"+maxHl.toLocaleString()+" (intrabar)</div>";
+}
+function ddFreqRerender(){
+  if(!LAST) return;
+  const days=(LAST.bars[LAST.iEnd].t-LAST.bars[LAST.iStart].t)/864e5;
+  renderDDFrequency(LAST.res,LAST.sim,LAST.bars,LAST.iStart,LAST.iEnd,days);
+}
+$("ddFreqEnabled").addEventListener("change",ddFreqRerender);
+for(let n=1;n<=5;n++) $("ddFreqT"+n).addEventListener("change",ddFreqRerender);
 
 /* ============================================================
    DISCOVERY / VALIDATION SPLIT — same params, two untouched windows.
