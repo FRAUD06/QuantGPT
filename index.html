@@ -303,6 +303,8 @@ body.focusMode #main{padding:8px}
       unlock(email, pass, true, true);
     }
     suSubmit.onclick=submitSignup;
+    suEmail.addEventListener("keydown", function(e){ if(e.key==="Enter") suPass.focus(); });
+    suPass.addEventListener("keydown", function(e){ if(e.key==="Enter") suPass2.focus(); });
     suPass2.addEventListener("keydown", function(e){ if(e.key==="Enter") submitSignup(); });
   })();
 
