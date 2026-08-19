@@ -599,6 +599,51 @@ body.focusMode #main{padding:8px}
     </div>
   </details>
 
+  <details class="group" id="crossAssetGroup">
+    <summary>Cross-asset combined test</summary>
+    <div class="body">
+      <div style="font-size:11px;color:var(--dim);margin-bottom:8px;line-height:1.4">
+        Run this main panel's current symbol/strategy (Leg 1) alongside up to 2 more asset+strategy
+        combos, and see the REAL combined account net/DD -- not each leg's numbers just added up.
+        Timing matters: two engines' worst weeks can overlap and compound the true combined DD, or
+        offset and diversify it away. Combined DD is close-based/daily (each leg's equity resampled
+        to daily, summed, then re-drawn-down) -- not tick-level intrabar alignment across
+        instruments. Each leg runs its strategy's own default params (not whatever's in the main
+        panel's Inputs section).
+      </div>
+      <div class="row"><label>Enable</label><input type="checkbox" id="xaEnabled"></div>
+      <div class="row"><label title="Prop firms typically reject opposite-direction positions on instruments built from overlapping underlying constituents (e.g. long MNQ + short MES). When on, whichever leg's trade opened first keeps priority; a conflicting same-group entry from another leg gets excluded from the combined result.">Block hedged entries</label><input type="checkbox" id="xaHedgeBlock" checked></div>
+      <div style="border-top:1px solid var(--border);margin:8px 0 4px;padding-top:6px;font-size:11.5px;font-weight:600">Leg 2</div>
+      <div class="row"><label>Symbol</label><select id="xa2Symbol" style="width:150px">
+        <option value="MNQ">MNQ</option><option value="MES">MES</option><option value="MGC" selected>MGC</option>
+        <option value="M2K">M2K</option><option value="M6E">M6E</option>
+      </select></div>
+      <div class="row"><label>Timeframe</label><select id="xa2Tf" style="width:150px">
+        <option value="1">1 min</option><option value="5">5 min</option><option value="15">15 min</option>
+        <option value="30">30 min</option><option value="60" selected>1 hour</option><option value="240">4 hour</option><option value="1440">1 day</option>
+      </select></div>
+      <div class="row"><label>Strategy</label><select id="xa2Strat" style="width:150px"></select></div>
+      <div class="row"><label>Point value $</label><input type="number" id="xa2Pv" value="10" step="0.5"></div>
+      <div class="row"><label>Min tick</label><input type="number" id="xa2Tick" value="0.1" step="0.01"></div>
+      <div style="border-top:1px solid var(--border);margin:8px 0 4px;padding-top:6px;font-size:11.5px;font-weight:600">Leg 3 <span style="font-weight:400;color:var(--dim)">(optional)</span></div>
+      <div class="row"><label>Use leg 3</label><input type="checkbox" id="xa3Enabled"></div>
+      <div class="row"><label>Symbol</label><select id="xa3Symbol" style="width:150px">
+        <option value="MNQ" selected>MNQ</option><option value="MES">MES</option><option value="MGC">MGC</option>
+        <option value="M2K">M2K</option><option value="M6E">M6E</option>
+      </select></div>
+      <div class="row"><label>Timeframe</label><select id="xa3Tf" style="width:150px">
+        <option value="1">1 min</option><option value="5">5 min</option><option value="15">15 min</option>
+        <option value="30">30 min</option><option value="60" selected>1 hour</option><option value="240">4 hour</option><option value="1440">1 day</option>
+      </select></div>
+      <div class="row"><label>Strategy</label><select id="xa3Strat" style="width:150px"></select></div>
+      <div class="row"><label>Point value $</label><input type="number" id="xa3Pv" value="2" step="0.5"></div>
+      <div class="row"><label>Min tick</label><input type="number" id="xa3Tick" value="0.25" step="0.01"></div>
+      <button id="xaRun" style="width:100%;margin-top:8px">Run combined test</button>
+      <div id="xaStatus" style="font-size:11px;color:var(--dim);margin-top:6px"></div>
+      <div id="xaResults" style="margin-top:8px"></div>
+    </div>
+  </details>
+
   <details class="group" id="varianceGroup">
     <summary>Robustness testing</summary>
     <div class="body">
@@ -2843,6 +2888,164 @@ $("ddFreqEnabled").addEventListener("change",ddFreqRerender);
 for(let n=1;n<=5;n++) $("ddFreqT"+n).addEventListener("change",ddFreqRerender);
 
 /* ============================================================
+   CROSS-ASSET COMBINED TEST — run this main panel's setup (Leg 1) plus up
+   to 2 more asset+strategy legs, and see the REAL combined account net/DD,
+   not each leg's numbers just added up. Two things this accounts for that
+   naive summing doesn't:
+   1. TIMING OVERLAP -- each leg's trades are booked to the calendar day
+      they exit, merged into one combined daily PnL series, then re-drawn-
+      down from scratch. Two legs' worst weeks can compound the real
+      combined DD, or land in different weeks and partly diversify it away
+      -- summing each leg's own standalone max DD misses this either way.
+   2. HEDGING RESTRICTIONS -- most prop firms block "hedged" positions:
+      simultaneously long one instrument and short another that's built
+      from overlapping underlying constituents (e.g. long MNQ + short MES
+      -- both are baskets of largely the same mega-cap US stocks). This is
+      a bucket/rule classification (ASSET_GROUP below), NOT a statistical
+      correlation coefficient -- MNQ vs MGC (equities vs. gold, no
+      constituent overlap) is fine to hold in both directions at once, no
+      matter what a correlation number says. When the "block hedged
+      entries" toggle is on, whichever leg's trade opened FIRST keeps its
+      position; a same-group, opposite-direction entry from a different
+      leg that would open while the first is still open gets excluded from
+      the combined calc entirely (that leg's own standalone stats are
+      unaffected -- only the combined figures reflect the block).
+   Also computes real Pearson correlation of daily underlying-asset
+   returns between each leg pair, shown as informational context (this
+   IS a proper statistical calc, just not what drives the hedge block).
+   ============================================================ */
+const ASSET_GROUP = { MNQ:"us_equity_index", MES:"us_equity_index", M2K:"us_equity_index", MGC:"metals", M6E:"fx" };
+
+async function runLeg(symbol, tfMin, stratId, pointValue, minTick){
+  const {bars} = await materialize(symbol, tfMin, -Infinity, Infinity);
+  const sim = {pointValue, minTick, commission:+$("commission").value||0, slippage:+$("slippage").value||0, initCap:+$("initCap").value||1e6, fillModel:$("fillModel").value};
+  let res;
+  if(stratId==="anq"){
+    res = runBacktest(bars, {}, sim, [0, bars.length-1]);
+  } else {
+    const comp = getComp(stratId);
+    if(!comp.step || (comp.errors&&comp.errors.length)) throw new Error("Leg strategy \""+(PINE_STRATS[stratId]?PINE_STRATS[stratId].name:stratId)+"\" has compile errors");
+    const defaults={}; for(const inp of comp.inputs) defaults[inp.k]=inp.d;
+    const savedData=DATA;
+    try{ DATA = savedData ? {...savedData, bars} : {bars}; res = runPine(comp, defaults, sim, [0, bars.length-1]); }
+    finally{ DATA = savedData; }
+  }
+  return {symbol, group:ASSET_GROUP[symbol]||symbol, bars, sim, trades:res.broker.positions};
+}
+
+// first-come-wins hedge blocking across legs, only checked cross-leg (a leg's own
+// trades already respect its own strategy.position_size==0-style sequencing internally)
+function applyHedgeBlocking(legs, blockEnabled){
+  if(!blockEnabled) return legs.map(l=>({...l, effectiveTrades:l.trades, blockedCount:0}));
+  const all=[];
+  legs.forEach((l,li)=>{ for(const t of l.trades) all.push({t, li, group:l.group}); });
+  all.sort((a,b)=>a.t.entryTime-b.t.entryTime);
+  const openByGroup={};
+  const blocked=new Set();
+  for(let idx=0;idx<all.length;idx++){
+    const {t, li, group}=all[idx];
+    const openList=openByGroup[group]||(openByGroup[group]=[]);
+    for(let j=openList.length-1;j>=0;j--) if(openList[j].exitTime<=t.entryTime) openList.splice(j,1);
+    const conflict=openList.some(o=>o.li!==li && o.dir!==t.dir);
+    if(conflict) blocked.add(idx);
+    else openList.push({li, dir:t.dir, exitTime:t.exitTime});
+  }
+  return legs.map((l,li)=>{
+    const effectiveTrades=[]; let blockedCount=0;
+    all.forEach((entry,idx)=>{ if(entry.li!==li) return; if(blocked.has(idx)) blockedCount++; else effectiveTrades.push(entry.t); });
+    return {...l, effectiveTrades, blockedCount};
+  });
+}
+function dailyPnlFromTrades(trades){
+  const m=new Map();
+  for(const t of trades){ const d=new Date(t.exitTime).toISOString().slice(0,10); m.set(d,(m.get(d)||0)+t.pnl); }
+  return m;
+}
+function dailyCloseMap(bars){
+  const m=new Map();
+  for(const b of bars) m.set(new Date(b.t).toISOString().slice(0,10), b.c);
+  return m;
+}
+function pearsonCorr(mapA,mapB){
+  const setB=new Set(mapB.keys());
+  const common=[...mapA.keys()].filter(d=>setB.has(d)).sort();
+  const retsA=[],retsB=[];
+  for(let i=1;i<common.length;i++){
+    const a0=mapA.get(common[i-1]),a1=mapA.get(common[i]),b0=mapB.get(common[i-1]),b1=mapB.get(common[i]);
+    if(a0) retsA.push((a1-a0)/a0); if(b0) retsB.push((b1-b0)/b0);
+  }
+  const n=Math.min(retsA.length,retsB.length); if(n<10) return null;
+  const meanA=retsA.slice(0,n).reduce((s,x)=>s+x,0)/n, meanB=retsB.slice(0,n).reduce((s,x)=>s+x,0)/n;
+  let cov=0,varA=0,varB=0;
+  for(let i=0;i<n;i++){ const da=retsA[i]-meanA, db=retsB[i]-meanB; cov+=da*db; varA+=da*da; varB+=db*db; }
+  if(varA===0||varB===0) return null;
+  return cov/Math.sqrt(varA*varB);
+}
+function closeMaxDDFromDaily(dailyPnlMap){
+  const dates=[...dailyPnlMap.keys()].sort();
+  let cum=0,peak=0,maxDD=0;
+  const series=[];
+  for(const d of dates){ cum+=dailyPnlMap.get(d); peak=Math.max(peak,cum); maxDD=Math.max(maxDD,peak-cum); series.push({d,cum}); }
+  return {maxDD, series, net: series.length?series[series.length-1].cum:0};
+}
+async function runCrossAssetTest(){
+  const status=$("xaStatus"), host=$("xaResults");
+  if(!$("xaEnabled").checked){ host.innerHTML=""; status.textContent=""; return; }
+  if(!LAST || !DATA){ status.innerHTML='<span class="neg">Run the main backtest first.</span>'; return; }
+  status.textContent="Running combined test…"; host.innerHTML="";
+  try{
+    const legs=[{symbol:currentSymbol(), group:ASSET_GROUP[currentSymbol()]||currentSymbol(), bars:LAST.bars, sim:LAST.sim, trades:LAST.res.broker.positions, label:currentSymbol()+" ("+DATA.interval+")"}];
+    const leg2=await runLeg($("xa2Symbol").value, +$("xa2Tf").value, $("xa2Strat").value, +$("xa2Pv").value, +$("xa2Tick").value);
+    legs.push({...leg2, label:$("xa2Symbol").value+" ("+$("xa2Tf").selectedOptions[0].textContent+")"});
+    if($("xa3Enabled").checked){
+      const leg3=await runLeg($("xa3Symbol").value, +$("xa3Tf").value, $("xa3Strat").value, +$("xa3Pv").value, +$("xa3Tick").value);
+      legs.push({...leg3, label:$("xa3Symbol").value+" ("+$("xa3Tf").selectedOptions[0].textContent+")"});
+    }
+    const blocked=applyHedgeBlocking(legs, $("xaHedgeBlock").checked);
+    const legDaily=blocked.map(l=>dailyPnlFromTrades(l.effectiveTrades));
+    const combinedDaily=new Map();
+    for(const dm of legDaily) for(const [d,v] of dm) combinedDaily.set(d,(combinedDaily.get(d)||0)+v);
+    const combined=closeMaxDDFromDaily(combinedDaily);
+    const legRows=blocked.map((l,i)=>{
+      const rawNet=l.trades.reduce((s,t)=>s+t.pnl,0);
+      const rawWins=l.trades.filter(t=>t.pnl>0).length;
+      const {maxDD:ddSolo,net:netSolo}=closeMaxDDFromDaily(dailyPnlFromTrades(l.trades));
+      return "<tr><td style='color:var(--dim)'>"+l.label+"</td>"+
+        "<td style='text-align:right' class='"+(netSolo>=0?'pos':'neg')+"'>"+fmt$(netSolo)+"</td>"+
+        "<td style='text-align:right'>"+fmt$(ddSolo)+"</td>"+
+        "<td style='text-align:right'>"+l.trades.length+"</td>"+
+        "<td style='text-align:right'>"+(l.blockedCount>0?"<span class='neg'>"+l.blockedCount+"</span>":"0")+"</td></tr>";
+    });
+    const table="<table style='width:100%;font-size:11.5px;border-collapse:collapse'>"+
+      "<tr><td></td><td style='text-align:right;color:var(--dim)'>Standalone net</td><td style='text-align:right;color:var(--dim)'>Standalone DD</td><td style='text-align:right;color:var(--dim)'>Trades</td><td style='text-align:right;color:var(--dim)'>Blocked</td></tr>"+
+      legRows.join("")+
+      "<tr><td style='border-top:1px solid var(--border);padding-top:4px'><b>Combined (actual)</b></td>"+
+      "<td style='text-align:right;border-top:1px solid var(--border);padding-top:4px' class='"+(combined.net>=0?'pos':'neg')+"'><b>"+fmt$(combined.net)+"</b></td>"+
+      "<td style='text-align:right;border-top:1px solid var(--border);padding-top:4px'><b>"+fmt$(combined.maxDD)+"</b></td><td></td><td></td></tr>"+
+      "</table>";
+    // correlation of underlying asset daily returns, every leg pair
+    let corrRows="";
+    for(let i=0;i<legs.length;i++) for(let j=i+1;j<legs.length;j++){
+      const r=pearsonCorr(dailyCloseMap(legs[i].bars), dailyCloseMap(legs[j].bars));
+      const sameGroup=legs[i].group===legs[j].group;
+      corrRows+="<div style='font-size:11px;color:var(--dim);margin-top:3px'>"+legs[i].label+" vs "+legs[j].label+": r="+(r===null?"n/a (not enough overlapping days)":r.toFixed(2))+
+        (sameGroup?" <span style='color:var(--amber)'>(same hedge group)</span>":" <span style='color:var(--dim)'>(different hedge group -- can hold opposite directions freely)</span>")+"</div>";
+    }
+    const anyBlocked=blocked.some(l=>l.blockedCount>0);
+    const hedgeNote=$("xaHedgeBlock").checked
+      ? (anyBlocked ? "<div style='margin-top:8px;padding:7px 9px;border-radius:6px;font-size:11.5px;background:#2a2a1a;border:1px solid #5c5c1e;color:#e8d87f'>Hedge blocking is ON and excluded "+blocked.reduce((s,l)=>s+l.blockedCount,0)+" opposite-direction, same-group entr"+(blocked.reduce((s,l)=>s+l.blockedCount,0)===1?"y":"ies")+" from the combined calc (first-open leg kept priority).</div>"
+                    : "<div style='margin-top:8px;font-size:11px;color:var(--dim)'>Hedge blocking is ON, but no same-group opposite-direction overlaps occurred -- nothing was excluded.</div>")
+      : "<div style='margin-top:8px;font-size:11px;color:var(--dim)'>Hedge blocking is OFF -- combined result assumes the account allows simultaneous opposite-direction positions across legs.</div>";
+    host.innerHTML=table+corrRows+hedgeNote+
+      "<div style='font-size:10.5px;color:var(--dim);margin-top:6px'>Combined DD is close-based/daily (trades booked to their exit date, summed across legs, re-drawn-down) -- not tick-level intrabar alignment across instruments. Each leg runs its strategy's own default params.</div>";
+    status.textContent="Done";
+  }catch(e){
+    status.innerHTML='<span class="neg">'+e.message+'</span>'; host.innerHTML="";
+  }
+}
+$("xaRun").onclick=runCrossAssetTest;
+
+/* ============================================================
    DISCOVERY / VALIDATION SPLIT — same params, two untouched windows.
    Tune against Discovery; Validation is the honesty check. Both runs go
    through runPine/runBacktest over the FULL DATA.bars array (indicators
@@ -3935,6 +4138,14 @@ function stratDefs(){
   if(id==="anq"||!PINE_STRATS[id]) return PARAM_DEFS;
   return [{g:"Inputs"}].concat(getComp(id).inputs.map(x=>({k:x.k,l:x.l,t:x.t,d:x.d,step:x.t==="int"?1:0.1})));
 }
+function populateLegStratSelect(el){
+  if(!el) return;
+  const cur=el.value; el.innerHTML='';
+  for(const [id,s] of Object.entries(PINE_STRATS)){
+    const op=document.createElement("option"); op.value=id; op.textContent=s.name; el.appendChild(op);
+  }
+  el.value=[...el.options].some(o=>o.value===cur)?cur:(el.options[0]?el.options[0].value:"");
+}
 function refreshStratSel(){
   const sel=$("stratSel"); const cur=sel.value;
   sel.innerHTML='';
@@ -3944,6 +4155,8 @@ function refreshStratSel(){
   sel.value=[...sel.options].some(o=>o.value===cur)?cur:(sel.options[0]?sel.options[0].value:"");
   $("btnDelStrat").style.display=sel.value==="anq"?"none":"";
   $("btnEditStrat").style.display=sel.value==="anq"?"none":"";
+  populateLegStratSelect($("xa2Strat"));
+  populateLegStratSelect($("xa3Strat"));
 }
 let editingId=null;
 function setEditing(id){
