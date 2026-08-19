@@ -2865,7 +2865,7 @@ async function doRun(){
   const t0=performance.now();
   const res=runBacktest(bars,P,sim,[iStart,iEnd]);
   const ms=performance.now()-t0;
-  LAST={res,sim,P,bars,iStart,iEnd};
+  LAST={res,sim,P,bars,iStart,iEnd,ms};
   renderResults(res,sim,bars,iStart,iEnd,ms);
 }
 
@@ -3236,6 +3236,10 @@ async function runCrossAssetTest(){
   if(!$("xaEnabled").checked){ host.innerHTML=""; status.textContent=""; return; }
   if(!LAST || !DATA){ status.innerHTML='<span class="neg">Run the main backtest first.</span>'; return; }
   status.textContent="Running combined test…"; host.innerHTML="";
+  // a fresh run invalidates any previous leg-preview index -- if the user was mid-preview,
+  // snap the main panel back to its own real results rather than leaving stale leg data on
+  // screen with the "back to main" button now hidden (no way back otherwise)
+  if(XA_VIEWING!==null) restoreMainView();
   try{
     const legs=[{symbol:currentSymbol(), group:ASSET_GROUP[currentSymbol()]||currentSymbol(), bars:LAST.bars, sim:LAST.sim, trades:LAST.res.broker.positions, res:LAST.res, label:currentSymbol()+" ("+DATA.interval+")"}];
     const leg2=await runLeg($("xa2Symbol").value, +$("xa2Tf").value, $("xa2Strat").value, +$("xa2Pv").value, +$("xa2Tick").value);
@@ -3279,17 +3283,101 @@ async function runCrossAssetTest(){
       ? (anyBlocked ? "<div style='margin-top:8px;padding:7px 9px;border-radius:6px;font-size:11.5px;background:#2a2a1a;border:1px solid #5c5c1e;color:#e8d87f'>Hedge blocking is ON and excluded "+blocked.reduce((s,l)=>s+l.blockedCount,0)+" opposite-direction, same-group entr"+(blocked.reduce((s,l)=>s+l.blockedCount,0)===1?"y":"ies")+" from the combined calc (first-open leg kept priority).</div>"
                     : "<div style='margin-top:8px;font-size:11px;color:var(--dim)'>Hedge blocking is ON, but no same-group opposite-direction overlaps occurred -- nothing was excluded.</div>")
       : "<div style='margin-top:8px;font-size:11px;color:var(--dim)'>Hedge blocking is OFF -- combined result assumes the account allows simultaneous opposite-direction positions across legs.</div>";
-    host.innerHTML=table+corrRows+hedgeNote+
+    const tabsHtml="<div id='xaLegTabs' style='display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px'>"+
+      legs.map((l,i)=>"<button class='small ghost xaTabBtn' data-legidx='"+i+"'>"+l.label+"</button>").join("")+
+      "<button class='small ghost xaTabBtn' data-legidx='combined'>Combined (equity)</button>"+
+      "</div>"+
+      "<div style='font-size:10.5px;color:var(--dim);margin-bottom:8px'>Click a leg to load its full interactive results (chart, trades, stat tiles) into the main panel below -- same view as your primary run, just pointed at that leg.</div>";
+    host.innerHTML=tabsHtml+table+corrRows+hedgeNote+
       "<div style='font-size:10.5px;color:var(--dim);margin-top:6px'>Combined DD is close-based/daily (trades booked to their exit date, summed across legs, re-drawn-down) -- not tick-level intrabar alignment across instruments. Each leg runs its strategy's own default params.</div>"+
-      "<div id='xaMetricsRows' style='margin-top:8px'></div>";
+      "<div id='xaMetricsRows' style='margin-top:8px'></div>"+
+      "<div style='margin-top:10px'><div style='font-size:11px;color:var(--dim);margin-bottom:4px'>Combined equity (daily, close-based)</div><canvas id='xaCombinedEqChart' height='90' style='width:100%'></canvas></div>";
     XA_LAST=legs;
+    XA_COMBINED=combined;
     renderXaMetricsRows();
+    drawXaCombinedEq();
+    updateXaTabsUI();
     status.textContent="Done";
   }catch(e){
-    status.innerHTML='<span class="neg">'+e.message+'</span>'; host.innerHTML=""; XA_LAST=null;
+    status.innerHTML='<span class="neg">'+e.message+'</span>'; host.innerHTML=""; XA_LAST=null; XA_COMBINED=null;
   }
 }
 $("xaRun").onclick=runCrossAssetTest;
+
+// ---- per-leg full-results preview: reuses the SAME main-panel chart/tiles/tables,
+// just pointed at a leg's own res/bars/sim instead of the primary run. "Combined" has
+// no real OHLC (it's a merged daily PnL series across instruments), so it only gets a
+// lightweight standalone equity sparkline (drawXaCombinedEq), not the full preview.
+let XA_VIEWING=null, XA_COMBINED=null;
+function drawXaCombinedEq(){
+  const cv=$("xaCombinedEqChart"); if(!cv||!XA_COMBINED) return;
+  const series=XA_COMBINED.series; if(!series||series.length<2) return;
+  const dpr=window.devicePixelRatio||1;
+  const w=cv.clientWidth||600, h=cv.height||90;
+  cv.width=w*dpr; cv.height=h*dpr;
+  const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,w,h);
+  const vals=series.map(p=>p.cum);
+  const mn=Math.min(0,...vals), mx=Math.max(0,...vals);
+  const pad=6, span=(mx-mn)||1;
+  const x=i=>pad+(w-2*pad)*i/(series.length-1);
+  const y=v=>h-pad-(h-2*pad)*(v-mn)/span;
+  ctx.strokeStyle="rgba(255,255,255,0.15)"; ctx.beginPath(); ctx.moveTo(pad,y(0)); ctx.lineTo(w-pad,y(0)); ctx.stroke();
+  ctx.lineWidth=1.5; ctx.strokeStyle=vals[vals.length-1]>=0?"#26a69a":"#ef5350"; ctx.beginPath();
+  series.forEach((p,i)=>{ const px=x(i), py=y(p.cum); i===0?ctx.moveTo(px,py):ctx.lineTo(px,py); });
+  ctx.stroke();
+}
+function renderLegPreview(idx){
+  const leg=XA_LAST&&XA_LAST[idx]; if(!leg) return;
+  const bars=leg.bars, res=leg.res, sim=leg.sim, iStart=0, iEnd=bars.length-1;
+  const st=computeStats(res,sim,bars,iStart,iEnd);
+  renderStatTiles(st,sim);
+  $("indicatorNote").style.display=(st.pos.length===0 && res.dr && (res.dr.boxes.length+res.dr.lines.length+res.dr.labels.length)>0) ? "block" : "none";
+  $("eqInfo").textContent="· previewing "+leg.label+" · "+(iEnd-iStart+1).toLocaleString()+" bars · "+st.days.toFixed(0)+" days";
+  chartSet(bars,res.equity,iStart,iEnd,sim,st.pos,res.dr||null,res.plt||null,res.plotMeta||[],res.overlay!==false);
+  renderEngineTable(st.pos);
+  renderMonthTable(st.pos, bars, res.equity, iStart, iEnd, res.equityBest, res.equityWorst);
+  renderTradeTable(st.pos);
+  $("btnExportTrades").disabled=st.pos.length===0;
+  renderDDFrequency(res,sim,bars,iStart,iEnd,st.days);
+  $("discValResults").innerHTML="<div style='font-size:11px;color:var(--dim)'>Discovery/validation split reflects the main panel's own run, not this leg preview. Click ← Back to main results to restore it.</div>";
+  $("discValStatus").textContent="";
+  XA_VIEWING=idx;
+  updateXaTabsUI();
+  $("chartCard").scrollIntoView({behavior:"smooth", block:"start"});
+}
+function restoreMainView(){
+  if(!LAST) return;
+  XA_VIEWING=null;
+  renderResults(LAST.res, LAST.sim, LAST.bars, LAST.iStart, LAST.iEnd, LAST.ms||0);
+  updateXaTabsUI();
+}
+function updateXaTabsUI(){
+  const bar=$("xaLegTabs"); if(!bar) return;
+  bar.querySelectorAll(".xaTabBtn").forEach(btn=>{
+    const isCombined=btn.dataset.legidx==="combined";
+    const active=!isCombined && XA_VIEWING===+btn.dataset.legidx;
+    btn.style.background=active?"var(--accent)":"";
+    btn.style.color=active?"#fff":"";
+  });
+  let backBtn=$("xaBackToMain");
+  if(XA_VIEWING!==null){
+    if(!backBtn){
+      backBtn=document.createElement("button");
+      backBtn.id="xaBackToMain"; backBtn.className="small ghost";
+      backBtn.textContent="← Back to main results";
+      backBtn.style.marginBottom="8px";
+      $("chartCard").parentNode.insertBefore(backBtn, $("chartCard"));
+      backBtn.onclick=restoreMainView;
+    }
+    backBtn.style.display="";
+  } else if(backBtn){ backBtn.style.display="none"; }
+}
+document.body.addEventListener("click",e=>{
+  const btn=e.target.closest(".xaTabBtn"); if(!btn) return;
+  const v=btn.dataset.legidx;
+  if(v==="combined"){ $("xaResults").scrollIntoView({behavior:"smooth", block:"center"}); return; }
+  renderLegPreview(+v);
+});
 // extra per-leg metrics, driven by the SAME customizable registry as the main tile grid --
 // deliberately STANDALONE per leg (not hedge-block-adjusted), same as the "Standalone
 // net/DD" columns above; rebuilding a bar-by-bar equity curve for the post-block trade
@@ -4550,7 +4638,7 @@ async function doRun(){
     $("statsHost").innerHTML="<div class='stat'><div class='k neg'>Run failed</div><div class='s'>"+e.message+"</div></div>"; return;
   }
   const ms=performance.now()-t0;
-  LAST={res,sim,P,bars,iStart,iEnd};
+  LAST={res,sim,P,bars,iStart,iEnd,ms};
   renderResults(res,sim,bars,iStart,iEnd,ms);
 }
 $("btnPasteToggle").onclick=()=>{ const b=$("pasteBox"); b.style.display=b.style.display==="none"?"":"none"; };
@@ -4627,9 +4715,13 @@ $("stratSel").addEventListener("change",()=>{ refreshStratSel(); buildParamsUI()
 refreshStratSel();
 
 $("btnExportTrades").onclick=()=>{
-  if(!LAST) return;
+  // respects whichever run is currently ON SCREEN -- the main panel's own run, or a
+  // cross-asset leg preview (renderLegPreview) -- so this never silently exports the
+  // wrong instrument's trades while a leg is being previewed.
+  const viewing = (XA_VIEWING!==null && XA_LAST && XA_LAST[XA_VIEWING]) ? XA_LAST[XA_VIEWING].res.broker.positions : (LAST?LAST.res.broker.positions:null);
+  if(!viewing) return;
   let s="num,engine,dir,qty,entry_time,entry_px,exit_time,avg_exit,pnl,mfe,mae,exit_reasons\n";
-  LAST.res.broker.positions.forEach((p,i)=>{
+  viewing.forEach((p,i)=>{
     const avgX=p.exits.reduce((a,f)=>a+f.px*f.qty,0)/p.exits.reduce((a,f)=>a+f.qty,0);
     s+=[i+1,p.mode,p.dir===1?"long":"short",p.qty,new Date(p.entryTime).toISOString(),p.avg.toFixed(2),
        new Date(p.exitTime).toISOString(),avgX.toFixed(2),p.pnl.toFixed(2),(p.mfe||0).toFixed(2),(p.mae||0).toFixed(2),
