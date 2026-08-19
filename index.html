@@ -418,6 +418,24 @@ body.focusMode #main{padding:8px}
     <div id="bugStatus" style="font-size:11px;color:var(--dim);margin-top:8px"></div>
   </div>
 </div>
+<div id="metricsModalOverlay" class="modalOverlay" style="display:none">
+  <div class="modalCard">
+    <div class="flex" style="justify-content:space-between;margin-bottom:10px">
+      <h2 style="margin:0">Customize metrics</h2>
+      <button class="small ghost" id="metricsCancel">&times;</button>
+    </div>
+    <div style="font-size:11px;color:var(--dim);margin-bottom:8px;line-height:1.4">
+      Pick which stat tiles show up above the chart. Applies to both the main results panel and
+      the cross-asset combined test's per-leg breakdown.
+    </div>
+    <div style="display:flex;gap:8px;margin-bottom:8px">
+      <button class="small ghost" id="metricsAll" style="flex:1">Select all</button>
+      <button class="small ghost" id="metricsNone" style="flex:1">Select none</button>
+    </div>
+    <div id="metricsChecklist" style="max-height:340px;overflow-y:auto"></div>
+    <button id="metricsSave" style="width:100%;margin-top:10px">Save</button>
+  </div>
+</div>
 <div id="sidebar">
   <div class="flex" style="justify-content:space-between;align-items:flex-start">
     <div>
@@ -475,7 +493,8 @@ body.focusMode #main{padding:8px}
         <div id="pineStatus" style="font-size:11.5px;margin-top:6px;line-height:1.5"></div>
         <div style="font-size:11px;color:var(--dim);margin-top:6px;line-height:1.45">
           Runs most Pine v5 directly: inputs, ta.* indicators, custom functions, arrays, loops, tuples,
-          request.security (same symbol), if/var/:=, strategy.entry/exit/close, and box.new/line.new/label.new
+          request.security (same symbol OR cross-symbol -- MNQ/MES/MGC/M2K/M6E/DX resolve automatically,
+          anything else needs a matching CSV uploaded first), if/var/:=, strategy.entry/exit/close, and box.new/line.new/label.new
           (zones, order blocks, S/D levels — these actually render on the chart now, not just no-ops).
           indicator() scripts work too — paste one with no strategy.entry calls and you'll get zones/levels with
           zeroed trade stats, which is expected. Line-plot-only indicators (a bare moving average, RSI line, etc.)
@@ -532,6 +551,14 @@ body.focusMode #main{padding:8px}
           Live Dukascopy/Yahoo fetching (the old MNQ-only 1-minute path) was removed -- it was
           fragile (CORS proxies, rate limits) and none of this project's validated research ever
           actually used 1-minute bars. If you need something finer than 15 min, drop a CSV above.
+        </div>
+        <div style="font-size:11px;color:var(--dim);margin-top:8px;line-height:1.4">
+          <b>request.security() cross-symbol references</b> now work: a pasted script can
+          reference MNQ/MES/MGC/M2K/M6E/DX by their normal tickers (bare, exchange-prefixed, or
+          the "1!" continuous form all resolve). Referencing anything else? Upload a CSV above
+          named to match the symbol first (e.g. drop a file named "DXY.csv" for a script that
+          calls <code>request.security("DXY", ...)</code>) -- it stays available for reference
+          for the rest of this session even after you switch the primary chart to something else.
         </div>
       </details>
     </div>
@@ -678,6 +705,9 @@ body.focusMode #main{padding:8px}
     <b>How this works:</b> pick a strategy, data downloads itself (cached after the first time), results update live as you change settings. It mirrors TradingView's fill engine but isn't TradingView — treat results as structure-testing, not penny-exact. Tip: set slippage to 1–2 ticks before trusting anything.
   </div>
   <div id="indicatorNote" style="display:none;font-size:11.5px;color:var(--dim);margin-bottom:8px">This script placed no trades — treating it as an indicator-only script (zones/lines/labels below, stats zeroed out as expected).</div>
+  <div class="flex" style="justify-content:flex-end;margin-bottom:6px">
+    <button class="small ghost" id="metricsOpen">⚙ Customize metrics</button>
+  </div>
   <div class="statgrid" id="statsHost"></div>
   <div class="card" id="chartCard">
     <div class="flex" style="justify-content:space-between;margin-bottom:6px">
@@ -2007,21 +2037,26 @@ function pineCompile(src){
     const salt=opt.salt||false;           // inside user functions: per-callsite TA state
     const htf=opt.htf||false;             // inside request.security expr: series → R[j]
     const strs=[]; e=e.replace(/"(?:[^"\\]|\\.)*"/g,m=>{strs.push(m);return "\x01"+(strs.length-1)+"\x01";});
-    // request.security — extract before anything else (top level only)
+    // request.security — extract before anything else (top level only). Two paths:
+    // same-symbol (syminfo.tickerid, an HTF read of the currently-loaded chart) resamples
+    // the primary bars array live as it goes, same as always. Any OTHER symbol expression
+    // (a literal string, an input.symbol() var, etc.) is now allowed too -- it's resolved
+    // against this app's known assets or an uploaded CSV, pre-fetched+resampled BEFORE the
+    // bar loop runs (see resolveRequestSecurityData at runtime setup), since fetching is
+    // async and the bar loop itself is synchronous.
     if(!htf){
       let rc;
       while((rc=extractCall(e,"request.security"))){
         const args=splitArgs(rc[2]);
         if(args.length<3){ errors.push("line "+(ln+1)+": request.security needs 3 args"); break; }
-        if(!/syminfo\.tickerid|ticker/.test(args[0])){
-          errors.push("line "+(ln+1)+": request.security only supports syminfo.tickerid as the symbol"); break;
-        }
+        const sameSymbol=/syminfo\.tickerid|ticker/.test(args[0]);
+        const symExprJS=sameSymbol?null:conv(args[0].replace(/\x01(\d+)\x01/g,(m,k)=>strs[+k]),ln,{locals});
         // tf can be a literal "TF" string OR any expression (input.timeframe var, a
         // ternary over an input, etc.) — resolved once, lazily, on first use at run time
         const tfExprJS=conv(args[1].replace(/\x01(\d+)\x01/g,(m,k)=>strs[+k]),ln,{locals});
         const exprJS=conv(args[2].replace(/\x01(\d+)\x01/g,(m,k)=>strs[+k]),ln,{htf:true,locals});
         const rid="q"+(reqN++);
-        reqs.push({rid, tfExprJS, exprJS});
+        reqs.push({rid, sameSymbol, symExprJS, tfExprJS, exprJS});
         e=e.slice(0,rc[0])+"RQ(\x02"+rid+"\x02,i)"+e.slice(rc[1]);
       }
     }
@@ -2501,6 +2536,70 @@ function SRC(name,B,i){
   }
 }
 
+/* ============================================================
+   CROSS-SYMBOL request.security() — resolves a symbol expression (a literal
+   string, an input.symbol() var, etc.) against this app's own assets or an
+   uploaded CSV, pre-fetches+resamples that OTHER symbol's bars ONCE (async,
+   before the synchronous bar loop runs), and caches the result on the
+   compiled script itself (comp._reqCache) so repeated runs of the same
+   script (every param tweak, every disc/val split) don't re-fetch.
+   Only the same-symbol form (syminfo.tickerid) skips all of this -- that
+   path still resamples the primary bars live, unchanged from before.
+   ============================================================ */
+const TFMS=tf=>{ if(/^\d+$/.test(tf))return +tf*60000; if(/^\d*D$/i.test(tf))return (parseInt(tf)||1)*86400000; if(/^\d*W$/i.test(tf))return (parseInt(tf)||1)*7*86400000; return 60*60000; };
+// aliases cover the common real-world ticker forms a pasted script might use --
+// exchange-prefixed ("COMEX_MINI:MGC1!"), bare continuous ("MGC1!"/"MGC1"), or the
+// underlying full-size contract (a script written for GC will resolve to MGC's data,
+// same instrument family, since this app doesn't carry full-size futures separately)
+const SYMBOL_ALIASES={
+  MNQ:["MNQ","MNQ1","MNQ1!","CME_MINI:MNQ1!","NQ","NQ1!","CME:NQ1!"],
+  MES:["MES","MES1","MES1!","CME_MINI:MES1!","ES","ES1!","CME:ES1!"],
+  MGC:["MGC","MGC1","MGC1!","COMEX_MINI:MGC1!","COMEX:MGC1!","GC","GC1!","COMEX:GC1!"],
+  M2K:["M2K","M2K1","M2K1!","CME_MINI:M2K1!","RTY","RTY1!","CME:RTY1!"],
+  M6E:["M6E","M6E1","M6E1!","CME:M6E1!","6E","6E1!","EURUSD"],
+  DX:["DX","DXY","DX1","DX1!","ICEUS:DX1!","ICE:DX1!","TVC:DXY","USDOLLAR"],
+};
+const REF_BASE_TF={MNQ:15,MES:15,MGC:15,M2K:15,M6E:15,DX:60}; // native resolution of each reference file
+const refBarsCache={}; // key -> Promise<bars[]>, fetched+parsed once then reused
+function getReferenceBars(key){
+  if(!refBarsCache[key]){
+    const path = key==="DX" ? "data/dx_1h.csv" : (ASSET_META[key] ? ASSET_META[key].file15m : null);
+    refBarsCache[key] = path ? fetchCsv(path).then(parseCSV) : Promise.reject(new Error("no reference data for "+key));
+  }
+  return refBarsCache[key];
+}
+// uploaded CSVs register here (see loadFile below) so request.security can find them by
+// filename too, independent of whichever dataset is CURRENTLY the active primary backtest
+const UPLOADED_REFS={}, UPLOADED_REFS_TF={};
+function normalizeSymbolStr(s){ return String(s||"").toUpperCase().replace(/^[A-Z_]+:/,"").replace(/!$/,"").replace(/\d+$/,"").trim(); }
+function resolveSymbolKey(rawSym){
+  const norm=normalizeSymbolStr(rawSym);
+  for(const [key,aliases] of Object.entries(SYMBOL_ALIASES)) if(aliases.some(a=>normalizeSymbolStr(a)===norm)) return {kind:"builtin",key};
+  for(const name of Object.keys(UPLOADED_REFS)) if(normalizeSymbolStr(name)===norm) return {kind:"uploaded",key:name};
+  return null;
+}
+async function resolveRequestSecurityData(comp){
+  if(!comp.reqs || !comp.reqs.length) return;
+  if(!comp._reqCache) comp._reqCache={};
+  const defaults={}; for(const inp of comp.inputs) defaults[inp.k]=inp.d;
+  for(const q of comp.reqs){
+    if(q.sameSymbol || comp._reqCache[q.rid]) continue;
+    let symVal="",tfVal="60";
+    try{ symVal=String(new Function("P","return ("+q.symExprJS+");")(defaults)); }catch(e){}
+    try{ tfVal=String(new Function("P","return ("+q.tfExprJS+");")(defaults)); }catch(e){}
+    const resolved=resolveSymbolKey(symVal);
+    if(!resolved) throw new Error('request.security references "'+symVal+'" which isn\'t one of this app\'s assets (MNQ/MES/MGC/M2K/M6E/DX) or an uploaded CSV — upload matching data via "Advanced (your own CSV)" first, named so it matches the symbol.');
+    const baseBars = resolved.kind==="builtin" ? await getReferenceBars(resolved.key) : UPLOADED_REFS[resolved.key];
+    const baseTfMin = resolved.kind==="builtin" ? REF_BASE_TF[resolved.key] : (UPLOADED_REFS_TF[resolved.key]||1);
+    const targetMin = TFMS(tfVal)/60000;
+    const resampled = targetMin>=baseTfMin ? resampleBars(baseBars, targetMin, baseTfMin) : baseBars; // can't derive finer than the source's own resolution
+    comp._reqCache[q.rid] = {
+      ms: targetMin*60000,
+      R: {t:resampled.map(b=>b.t), o:resampled.map(b=>b.o), h:resampled.map(b=>b.h), l:resampled.map(b=>b.l), c:resampled.map(b=>b.c), v:resampled.map(b=>b.v)}
+    };
+  }
+}
+
 function runPine(comp, P, sim, range){
   const bars=DATA.bars, n=bars.length;
   const B={t:new Float64Array(n),o:new Float64Array(n),h:new Float64Array(n),l:new Float64Array(n),c:new Float64Array(n),v:new Float64Array(n)};
@@ -2617,16 +2716,37 @@ function runPine(comp, P, sim, range){
     grossLoss:()=>br.grossLoss,
     posName:()=>br.legOrder.length?br.legOrder[br.legOrder.length-1]:"",
   };
-  const TFMS=tf=>{ if(/^\d+$/.test(tf))return +tf*60000; if(/^\d*D$/i.test(tf))return (parseInt(tf)||1)*86400000; if(/^\d*W$/i.test(tf))return (parseInt(tf)||1)*7*86400000; return 60*60000; };
   const REQ={};
   for(const q of (comp.reqs||[])){
+    if(!q.sameSymbol){
+      // cross-symbol: MUST have been pre-resolved by resolveRequestSecurityData(comp)
+      // before runPine was called (fetching is async, the bar loop below is not) --
+      // fail loudly here rather than silently falling through to the same-symbol path
+      // and reading the wrong (primary) instrument's data.
+      if(!comp._reqCache || !comp._reqCache[q.rid]) throw new Error('request.security("'+ (q.symExprJS||"?") +'", ...) data was never pre-fetched -- call resolveRequestSecurityData(comp) before runPine()');
+      const cache=comp._reqCache[q.rid];
+      REQ[q.rid]={cross:true, ms:cache.ms, R:cache.R, ptr:-1,
+        fn:new Function("j","R","P","TA","M","_na","_nz","_avg","_round","_cnew","_noop","PINE_TIME","PDATE","SRC","AR","_sfmt","return ("+q.exprJS+");"),
+        val:NaN};
+      continue;
+    }
     let tfFn=null;
     try{ tfFn=new Function("i","B","V","VH","D","P","RT","M","TA","_na","_nz","_avg","_round","_cnew","_noop","PINE_TIME","PDATE","SRC","AR","_sfmt","return ("+q.tfExprJS+");"); }catch(e){}
-    REQ[q.rid]={ms:null, tfFn, fn:new Function("j","R","P","TA","M","_na","_nz","_avg","_round","_cnew","_noop","PINE_TIME","PDATE","SRC","AR","_sfmt","return ("+q.exprJS+");"),
+    REQ[q.rid]={cross:false, ms:null, tfFn, fn:new Function("j","R","P","TA","M","_na","_nz","_avg","_round","_cnew","_noop","PINE_TIME","PDATE","SRC","AR","_sfmt","return ("+q.exprJS+");"),
       R:{t:[],o:[],h:[],l:[],c:[],v:[]}, cur:null, bkt:NaN, val:NaN};
   }
   function RQ(rid,i){
     const s=REQ[rid]; if(!s)return NaN;
+    if(s.cross){
+      // full pre-resampled OTHER-symbol series already sitting in s.R; just advance a
+      // monotonic "as of" pointer -- only a bar that's FULLY closed by B.t[i] is visible
+      // (lookahead_off semantics), matching real TradingView's request.security default
+      const R=s.R;
+      while(s.ptr+1<R.t.length && R.t[s.ptr+1]+s.ms<=B.t[i]) s.ptr++;
+      if(s.ptr<0) return NaN;
+      try{ s.val=s.fn(s.ptr,R,P,TA,M,_na,_nz,_avg,_round,_cnew,_noop,PINE_TIME,PDATE,SRC,AR,_sfmt); }catch(e){ s.val=NaN; }
+      return s.val;
+    }
     if(s.ms==null){
       // tf is resolved once, lazily — it can be a literal "TF" string or any
       // expression (input.timeframe var, a ternary over an input, etc.); either
@@ -2794,27 +2914,147 @@ function computeStats(res,sim,bars,iStart,iEnd){
   // classic overfit/mirage red flag even when headline PF looks fine.
   const byPnlDesc=[...pos].sort((a,b)=>b.pnl-a.pnl);
   const top=(k)=>{ const s=byPnlDesc.slice(0,k).reduce((a,p)=>a+p.pnl,0); return net!==0 ? s/net*100 : 0; };
+
+  // sortino -- same daily-return series as sharpe, but only downside deviation in the
+  // denominator (upside volatility isn't "risk" to a sortino-style investor)
+  const downRets=drets.filter(x=>x<0);
+  const downDev=Math.sqrt(downRets.reduce((s,x)=>s+x*x,0)/(downRets.length||1));
+  const sortino=downDev>0?mu/downDev*Math.sqrt(252):0;
+  // calmar -- annualized return % / max close-based DD %, and the simpler $-for-$ recovery
+  // factor (net / max DD, no annualization) -- related but distinct, both worth showing
+  const annualizedRetPct=days>0?(net/sim.initCap)*(365/days)*100:0;
+  const calmar=maxDDpct>0?annualizedRetPct/maxDDpct:0;
+  const recoveryFactor=maxDD>0?net/maxDD:0;
+  // trade distribution -- median resists outlier skew that the mean (avg trade) doesn't
+  const pnls=pos.map(p=>p.pnl).sort((a,b)=>a-b);
+  const median=pnls.length?(pnls.length%2?pnls[(pnls.length-1)/2]:(pnls[pnls.length/2-1]+pnls[pnls.length/2])/2):0;
+  const pnlMean=pnls.length?pnls.reduce((s,x)=>s+x,0)/pnls.length:0;
+  const pnlStd=pnls.length?Math.sqrt(pnls.reduce((s,x)=>s+(x-pnlMean)*(x-pnlMean),0)/pnls.length):0;
+  const bestTrade=pos.length?Math.max(...pos.map(p=>p.pnl)):0;
+  const worstTrade=pos.length?Math.min(...pos.map(p=>p.pnl)):0;
+  // hold duration + time-in-market -- both from entry/exit timestamps directly
+  const holdMs=pos.map(p=>p.exitTime-p.entryTime);
+  const avgHoldMs=holdMs.length?holdMs.reduce((s,x)=>s+x,0)/holdMs.length:0;
+  const totalHoldMs=holdMs.reduce((s,x)=>s+x,0);
+  const totalRangeMs=bars[iEnd].t-bars[iStart].t;
+  const pctTimeInMarket=totalRangeMs>0?totalHoldMs/totalRangeMs*100:0;
+  // win/loss streaks -- max consec wins mirrors the existing max consec LOSSES above;
+  // avg streak length answers "how long do winning/losing runs typically go" beyond just the max
+  let maxConsecW=0,runW=0; const winStreaks=[],lossStreaks=[]; let curStreakLen=0,curStreakIsWin=null;
+  for(const p of pos){
+    const isWin=p.pnl>0;
+    if(isWin){ runW++; maxConsecW=Math.max(maxConsecW,runW); } else runW=0;
+    if(curStreakIsWin===null){ curStreakIsWin=isWin; curStreakLen=1; }
+    else if(isWin===curStreakIsWin){ curStreakLen++; }
+    else{ (curStreakIsWin?winStreaks:lossStreaks).push(curStreakLen); curStreakIsWin=isWin; curStreakLen=1; }
+  }
+  if(curStreakLen>0) (curStreakIsWin?winStreaks:lossStreaks).push(curStreakLen);
+  const avgWinStreak=winStreaks.length?winStreaks.reduce((s,x)=>s+x,0)/winStreaks.length:0;
+  const avgLossStreak=lossStreaks.length?lossStreaks.reduce((s,x)=>s+x,0)/lossStreaks.length:0;
+  // avg concurrent positions -- mostly meaningful for pyramiding scripts or as a per-leg
+  // input to the cross-asset panel's combined exposure figure; time-weighted average of
+  // how many trades were simultaneously open, using entry/exit as a sweep-line
+  let avgConcurrent=0;
+  if(pos.length && totalRangeMs>0){
+    const events=[];
+    for(const p of pos){ events.push([p.entryTime,1]); events.push([p.exitTime,-1]); }
+    events.sort((a,b)=>a[0]-b[0]);
+    let open=0,lastT=bars[iStart].t,weighted=0;
+    for(const [t,delta] of events){ weighted+=open*(t-lastT); open+=delta; lastT=t; }
+    weighted+=open*(bars[iEnd].t-lastT);
+    avgConcurrent=weighted/totalRangeMs;
+  }
   return {pos,net,wins,losses,gw,gl,pf,maxDD,maxDDpct,maxDDHL,maxDDHLpct,bh,sharpe,drets,maxConsecL,days,
-    top10pct:top(10),top20pct:top(20)};
+    top10pct:top(10),top20pct:top(20),sortino,calmar,recoveryFactor,annualizedRetPct,
+    median,pnlStd,bestTrade,worstTrade,avgHoldMs,pctTimeInMarket,
+    maxConsecW,avgWinStreak,avgLossStreak,avgConcurrent};
 }
+
+/* ============================================================
+   CUSTOMIZABLE METRICS — a single registry drives both the main results
+   tile grid and the cross-asset panel's per-leg breakdown, so a metric
+   only needs implementing once. get(st,sim) mirrors the tile-array shape
+   this file already used inline: [value, subtitle, "pos"|"neg"|""].
+   Deliberately does NOT include an R-multiple/expectancy-in-R metric --
+   trade objects never capture initial stop distance (see Broker._fillLeg
+   above), only realized MFE/MAE, so a true R-multiple isn't honestly
+   computable here without a deeper engine change.
+   ============================================================ */
+function fmtDur(ms){
+  if(!isFinite(ms)||ms<=0) return "—";
+  const mins=ms/60000;
+  if(mins<60) return mins.toFixed(0)+"m";
+  const hrs=mins/60;
+  if(hrs<24) return hrs.toFixed(1)+"h";
+  return (hrs/24).toFixed(1)+"d";
+}
+const METRIC_DEFS=[
+  {key:"netPnl",label:"Net PnL",cat:"Core",get:(st,sim)=>[fmt$(st.net),(st.net/sim.initCap*100).toFixed(2)+"% of capital",st.net>=0?"pos":"neg"]},
+  {key:"pf",label:"Profit factor",cat:"Core",get:(st)=>[isFinite(st.pf)?fmtN(st.pf,2):"∞",fmt$(st.gw)+" / -"+fmt$(st.gl).slice(1),st.pf>=1?"pos":"neg"]},
+  {key:"wr",label:"Win rate",cat:"Core",get:(st)=>[st.pos.length?(st.wins.length/st.pos.length*100).toFixed(1)+"%":"—",st.wins.length+" / "+st.pos.length+" positions",""]},
+  {key:"avgTrade",label:"Avg trade",cat:"Core",get:(st)=>[st.pos.length?fmt$(st.net/st.pos.length):"—","win "+(st.wins.length?fmt$(st.gw/st.wins.length):"—")+" · loss "+(st.losses.length?fmt$(-st.gl/st.losses.length):"—"),st.net>=0?"pos":"neg"]},
+  {key:"buyHold",label:"Buy & hold (1 ct)",cat:"Core",get:(st)=>[fmt$(st.bh),"vs strategy "+fmt$(st.net),st.bh>=0?"pos":"neg"]},
+  {key:"ddClose",label:"Max drawdown (close)",cat:"Risk",get:(st)=>[fmt$(st.maxDD),st.maxDDpct.toFixed(2)+"% · live-acct style","neg"]},
+  {key:"ddIntrabar",label:"Max drawdown (intrabar)",cat:"Risk",get:(st)=>[fmt$(st.maxDDHL),st.maxDDHLpct.toFixed(2)+"% · prop-firm worst-case","neg"]},
+  {key:"sharpe",label:"Sharpe (daily)",cat:"Risk-adjusted",get:(st)=>[fmtN(st.sharpe,2),st.drets.length+" days",""]},
+  {key:"sortino",label:"Sortino (daily)",cat:"Risk-adjusted",get:(st)=>[fmtN(st.sortino,2),"downside-only volatility",""]},
+  {key:"calmar",label:"Calmar ratio",cat:"Risk-adjusted",get:(st)=>[fmtN(st.calmar,2),"annualized return % / DD%",st.calmar>=0?"pos":"neg"]},
+  {key:"recoveryFactor",label:"Recovery factor",cat:"Risk-adjusted",get:(st)=>[fmtN(st.recoveryFactor,2),"net $ / max DD $",st.recoveryFactor>=0?"pos":"neg"]},
+  {key:"bestTrade",label:"Best trade",cat:"Distribution",get:(st)=>[fmt$(st.bestTrade),"","pos"]},
+  {key:"worstTrade",label:"Worst trade",cat:"Distribution",get:(st)=>[fmt$(st.worstTrade),"","neg"]},
+  {key:"medianTrade",label:"Median trade",cat:"Distribution",get:(st)=>[fmt$(st.median),"vs mean "+fmt$(st.pos.length?st.net/st.pos.length:0),st.median>=0?"pos":"neg"]},
+  {key:"pnlStd",label:"Trade PnL std dev",cat:"Distribution",get:(st)=>[fmt$(st.pnlStd),"spread around the mean",""]},
+  {key:"avgHold",label:"Avg hold duration",cat:"Exposure",get:(st)=>[fmtDur(st.avgHoldMs),"",""]},
+  {key:"timeInMarket",label:"% time in market",cat:"Exposure",get:(st)=>[st.pctTimeInMarket.toFixed(1)+"%","",""]},
+  {key:"avgConcurrent",label:"Avg concurrent positions",cat:"Exposure",get:(st)=>[fmtN(st.avgConcurrent,2),"time-weighted",""]},
+  {key:"maxConsecL",label:"Max consec losses",cat:"Streaks",get:(st)=>[st.maxConsecL,"","neg"]},
+  {key:"maxConsecW",label:"Max consec wins",cat:"Streaks",get:(st)=>[st.maxConsecW,"","pos"]},
+  {key:"avgWinStreak",label:"Avg win streak",cat:"Streaks",get:(st)=>[fmtN(st.avgWinStreak,1),"trades","pos"]},
+  {key:"avgLossStreak",label:"Avg loss streak",cat:"Streaks",get:(st)=>[fmtN(st.avgLossStreak,1),"trades","neg"]},
+];
+function loadVisibleMetrics(){
+  try{ const v=JSON.parse(localStorage.getItem("visibleMetrics")||"null"); if(Array.isArray(v)) return v; }catch(e){}
+  return METRIC_DEFS.map(m=>m.key); // default: everything on
+}
+function saveVisibleMetrics(keys){ try{ localStorage.setItem("visibleMetrics",JSON.stringify(keys)); }catch(e){} }
+function renderStatTiles(st,sim){
+  const visible=new Set(loadVisibleMetrics());
+  const defs=METRIC_DEFS.filter(m=>visible.has(m.key));
+  $("statsHost").innerHTML=defs.map(m=>{
+    const [v,s,cls]=m.get(st,sim);
+    return "<div class='stat'><div class='k'>"+m.label+"</div><div class='v "+cls+"'>"+v+"</div><div class='s'>"+s+"</div></div>";
+  }).join("");
+}
+(function(){
+  const overlay=$("metricsModalOverlay"), list=$("metricsChecklist");
+  function buildChecklist(){
+    const visible=new Set(loadVisibleMetrics());
+    const cats={};
+    for(const m of METRIC_DEFS){ (cats[m.cat]=cats[m.cat]||[]).push(m); }
+    list.innerHTML=Object.entries(cats).map(([cat,ms])=>
+      "<div style='font-size:11px;color:var(--dim);margin:8px 0 4px;text-transform:uppercase;letter-spacing:.03em'>"+cat+"</div>"+
+      ms.map(m=>"<div class='row' style='margin-bottom:4px'><label style='font-size:12.5px'>"+m.label+"</label><input type='checkbox' class='metricCk' data-key='"+m.key+"' "+(visible.has(m.key)?"checked":"")+"></div>").join("")
+    ).join("");
+  }
+  $("metricsOpen").onclick=()=>{ buildChecklist(); overlay.style.display="flex"; };
+  $("metricsCancel").onclick=()=>{ overlay.style.display="none"; };
+  $("metricsAll").onclick=()=>{ list.querySelectorAll(".metricCk").forEach(el=>el.checked=true); };
+  $("metricsNone").onclick=()=>{ list.querySelectorAll(".metricCk").forEach(el=>el.checked=false); };
+  $("metricsSave").onclick=()=>{
+    const keys=[...list.querySelectorAll(".metricCk")].filter(el=>el.checked).map(el=>el.dataset.key);
+    saveVisibleMetrics(keys);
+    overlay.style.display="none";
+    if(LAST) renderStatTiles(computeStats(LAST.res,LAST.sim,LAST.bars,LAST.iStart,LAST.iEnd),LAST.sim);
+    renderXaMetricsRows();
+  };
+})();
 
 function renderResults(res,sim,bars,iStart,iEnd,ms){
   const eq=res.equity, eqBest=res.equityBest, eqWorst=res.equityWorst;
   const st=computeStats(res,sim,bars,iStart,iEnd);
-  const {pos,net,wins,losses,gw,gl,pf,maxDD,maxDDpct,maxDDHL,maxDDHLpct,bh,sharpe,drets,maxConsecL,days}=st;
+  const {pos,days}=st;
 
-  const S=[
-    ["Net PnL",fmt$(net),(net/sim.initCap*100).toFixed(2)+"% of capital",net>=0?"pos":"neg"],
-    ["Profit factor",isFinite(pf)?fmtN(pf,2):"∞",fmt$(gw)+" / -"+fmt$(gl).slice(1),pf>=1?"pos":"neg"],
-    ["Win rate",pos.length?(wins.length/pos.length*100).toFixed(1)+"%":"—",wins.length+" / "+pos.length+" positions",""],
-    ["Max drawdown (close)",fmt$(maxDD),maxDDpct.toFixed(2)+"% · live-acct style","neg"],
-    ["Max drawdown (intrabar)",fmt$(maxDDHL),maxDDHLpct.toFixed(2)+"% · prop-firm worst-case","neg"],
-    ["Avg trade",pos.length?fmt$(net/pos.length):"—","win "+(wins.length?fmt$(gw/wins.length):"—")+" · loss "+(losses.length?fmt$(-gl/losses.length):"—"),net>=0?"pos":"neg"],
-    ["Sharpe (daily)",fmtN(sharpe,2),drets.length+" days",""],
-    ["Max consec losses",maxConsecL,"","neg"],
-    ["Buy & hold (1 ct)",fmt$(bh),"vs strategy "+fmt$(net),bh>=0?"pos":"neg"],
-  ];
-  $("statsHost").innerHTML=S.map(s=>"<div class='stat'><div class='k'>"+s[0]+"</div><div class='v "+s[3]+"'>"+s[1]+"</div><div class='s'>"+s[2]+"</div></div>").join("");
+  renderStatTiles(st,sim);
   $("indicatorNote").style.display=(pos.length===0 && res.dr && (res.dr.boxes.length+res.dr.lines.length+res.dr.labels.length)>0) ? "block" : "none";
   $("eqInfo").textContent="· "+(iEnd-iStart+1).toLocaleString()+" bars · "+days.toFixed(0)+" days · sim "+ms.toFixed(0)+"ms";
 
@@ -2925,12 +3165,13 @@ async function runLeg(symbol, tfMin, stratId, pointValue, minTick){
   } else {
     const comp = getComp(stratId);
     if(!comp.step || (comp.errors&&comp.errors.length)) throw new Error("Leg strategy \""+(PINE_STRATS[stratId]?PINE_STRATS[stratId].name:stratId)+"\" has compile errors");
+    await resolveRequestSecurityData(comp);
     const defaults={}; for(const inp of comp.inputs) defaults[inp.k]=inp.d;
     const savedData=DATA;
     try{ DATA = savedData ? {...savedData, bars} : {bars}; res = runPine(comp, defaults, sim, [0, bars.length-1]); }
     finally{ DATA = savedData; }
   }
-  return {symbol, group:ASSET_GROUP[symbol]||symbol, bars, sim, trades:res.broker.positions};
+  return {symbol, group:ASSET_GROUP[symbol]||symbol, bars, sim, trades:res.broker.positions, res};
 }
 
 // first-come-wins hedge blocking across legs, only checked cross-leg (a leg's own
@@ -2994,7 +3235,7 @@ async function runCrossAssetTest(){
   if(!LAST || !DATA){ status.innerHTML='<span class="neg">Run the main backtest first.</span>'; return; }
   status.textContent="Running combined test…"; host.innerHTML="";
   try{
-    const legs=[{symbol:currentSymbol(), group:ASSET_GROUP[currentSymbol()]||currentSymbol(), bars:LAST.bars, sim:LAST.sim, trades:LAST.res.broker.positions, label:currentSymbol()+" ("+DATA.interval+")"}];
+    const legs=[{symbol:currentSymbol(), group:ASSET_GROUP[currentSymbol()]||currentSymbol(), bars:LAST.bars, sim:LAST.sim, trades:LAST.res.broker.positions, res:LAST.res, label:currentSymbol()+" ("+DATA.interval+")"}];
     const leg2=await runLeg($("xa2Symbol").value, +$("xa2Tf").value, $("xa2Strat").value, +$("xa2Pv").value, +$("xa2Tick").value);
     legs.push({...leg2, label:$("xa2Symbol").value+" ("+$("xa2Tf").selectedOptions[0].textContent+")"});
     if($("xa3Enabled").checked){
@@ -3037,13 +3278,39 @@ async function runCrossAssetTest(){
                     : "<div style='margin-top:8px;font-size:11px;color:var(--dim)'>Hedge blocking is ON, but no same-group opposite-direction overlaps occurred -- nothing was excluded.</div>")
       : "<div style='margin-top:8px;font-size:11px;color:var(--dim)'>Hedge blocking is OFF -- combined result assumes the account allows simultaneous opposite-direction positions across legs.</div>";
     host.innerHTML=table+corrRows+hedgeNote+
-      "<div style='font-size:10.5px;color:var(--dim);margin-top:6px'>Combined DD is close-based/daily (trades booked to their exit date, summed across legs, re-drawn-down) -- not tick-level intrabar alignment across instruments. Each leg runs its strategy's own default params.</div>";
+      "<div style='font-size:10.5px;color:var(--dim);margin-top:6px'>Combined DD is close-based/daily (trades booked to their exit date, summed across legs, re-drawn-down) -- not tick-level intrabar alignment across instruments. Each leg runs its strategy's own default params.</div>"+
+      "<div id='xaMetricsRows' style='margin-top:8px'></div>";
+    XA_LAST=legs;
+    renderXaMetricsRows();
     status.textContent="Done";
   }catch(e){
-    status.innerHTML='<span class="neg">'+e.message+'</span>'; host.innerHTML="";
+    status.innerHTML='<span class="neg">'+e.message+'</span>'; host.innerHTML=""; XA_LAST=null;
   }
 }
 $("xaRun").onclick=runCrossAssetTest;
+// extra per-leg metrics, driven by the SAME customizable registry as the main tile grid --
+// deliberately STANDALONE per leg (not hedge-block-adjusted), same as the "Standalone
+// net/DD" columns above; rebuilding a bar-by-bar equity curve for the post-block trade
+// subset would be a much bigger undertaking than this panel needs. netPnl/ddClose are
+// skipped here since the main table above already shows those two.
+let XA_LAST=null;
+function renderXaMetricsRows(){
+  const host=$("xaMetricsRows"); if(!host || !XA_LAST) return;
+  const visible=new Set(loadVisibleMetrics());
+  const defs=METRIC_DEFS.filter(m=>visible.has(m.key) && m.key!=="netPnl" && m.key!=="ddClose");
+  if(!defs.length){ host.innerHTML=""; return; }
+  const legStats=XA_LAST.map(l=>computeStats(l.res,l.sim,l.bars,0,l.bars.length-1));
+  let rows="<tr><td></td>"+XA_LAST.map(l=>"<td style='text-align:right;color:var(--dim)'>"+l.label+"</td>").join("")+"</tr>";
+  for(const m of defs){
+    rows+="<tr><td style='color:var(--dim)'>"+m.label+"</td>"+
+      XA_LAST.map((l,i)=>{
+        const [v,,cls]=m.get(legStats[i],l.sim);
+        return "<td style='text-align:right'"+(cls?" class='"+cls+"'":"")+">"+v+"</td>";
+      }).join("")+"</tr>";
+  }
+  host.innerHTML="<div style='font-size:11px;color:var(--dim);margin-bottom:4px'>Additional metrics (standalone per leg, from Customize metrics):</div>"+
+    "<table style='width:100%;font-size:11.5px;border-collapse:collapse'>"+rows+"</table>";
+}
 
 /* ============================================================
    DISCOVERY / VALIDATION SPLIT — same params, two untouched windows.
@@ -3087,7 +3354,10 @@ async function runDiscVal(){
     return runPine(comp,P,sim,[i0,i1]);
   }
   let discRes,valRes;
-  try{ discRes=runRange(discI0,discI1); valRes=runRange(valI0,valI1); }
+  try{
+    if(id!=="anq"){ const comp=getComp(id); if(comp.step&&!comp.errors.length) await resolveRequestSecurityData(comp); }
+    discRes=runRange(discI0,discI1); valRes=runRange(valI0,valI1);
+  }
   catch(e){ status.innerHTML='<span class="neg">'+e.message+'</span>'; host.innerHTML=""; return; }
   const d=computeStats(discRes,sim,bars,discI0,discI1);
   const v=computeStats(valRes,sim,bars,valI0,valI1);
@@ -4266,6 +4536,7 @@ async function doRun(){
     else{
       const comp=getComp(id);
       if(!comp.step||comp.errors.length){ $("statsHost").innerHTML="<div class='stat'><div class='k neg'>Strategy has errors — reopen the paste box</div></div>"; return; }
+      await resolveRequestSecurityData(comp);
       res=runPine(comp,P,sim,[iStart,iEnd]);
     }
   }catch(e){
@@ -4528,7 +4799,12 @@ function loadFile(f){
   const rd=new FileReader();
   rd.onload=()=>{ try{
       const bars=parseCSV(rd.result);
-      adoptData(f.name.replace(/\.\w+$/,""),"CSV("+tfMinutes(bars)+"m)",bars);
+      const name=f.name.replace(/\.\w+$/,"");
+      // also registers into UPLOADED_REFS so request.security() in a pasted script can
+      // reference this data by (normalized) filename, independent of whether it's still
+      // the active primary backtest dataset -- persists for the rest of this session
+      UPLOADED_REFS[name]=bars; UPLOADED_REFS_TF[name]=tfMinutes(bars);
+      adoptData(name,"CSV("+tfMinutes(bars)+"m)",bars);
     }catch(e){ setStatus('<span class="neg">CSV parse failed: '+e.message+'</span>'); } };
   rd.readAsText(f);
 }
