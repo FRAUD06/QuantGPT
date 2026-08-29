@@ -445,6 +445,14 @@ body.focusMode #main{padding:8px}
       <button class="small ghost" id="xaLegModalClose" style="flex-shrink:0">&times; Close</button>
     </div>
     <div id="xaLegModalMount"></div>
+    <div id="xaCombinedPanel" style="display:none">
+      <div id="xaCombinedSummary" style="font-size:11.5px;color:var(--dim);margin-bottom:10px"></div>
+      <div id="xaCombinedCharts"></div>
+      <div style="position:relative;margin-top:14px">
+        <div style="font-size:11px;color:var(--dim);margin-bottom:4px">Combined equity (daily, close-based, all legs merged)</div>
+        <canvas id="xaCombinedEqChartBig" height="150" style="width:100%;cursor:default"></canvas>
+      </div>
+    </div>
   </div>
 </div>
 <div id="sidebar">
@@ -3328,16 +3336,21 @@ $("xa3Symbol").addEventListener("change", ()=>syncLegAssetFields("xa3Symbol","xa
 $("xaRun").onclick=runCrossAssetTest;
 
 // ---- per-leg full-results preview: reuses the SAME main-panel chart/tiles/tables,
-// just pointed at a leg's own res/bars/sim instead of the primary run. "Combined" has
-// no real OHLC (it's a merged daily PnL series across instruments), so it only gets a
-// lightweight standalone equity sparkline (drawXaCombinedEq), not the full preview.
+// just pointed at a leg's own res/bars/sim instead of the primary run.
 let XA_VIEWING=null, XA_COMBINED=null;
-function drawXaCombinedEq(){
-  const cv=$("xaCombinedEqChart"); if(!cv||!XA_COMBINED) return;
+function drawXaCombinedEq(canvasId){
+  const cv=$(canvasId||"xaCombinedEqChart"); if(!cv||!XA_COMBINED) return;
   const series=XA_COMBINED.series; if(!series||series.length<2) return;
+  // lock the logical height ONCE via a data attribute (same pattern as setupCanvas()) --
+  // reading cv.height directly would pick up the ALREADY-dpr-scaled buffer size from a
+  // previous draw and compound it further on every redraw (this canvas, unlike the
+  // sidebar's small one, is a static element that gets redrawn in place across repeated
+  // "Combined" tab clicks rather than being recreated fresh each time).
+  if(!cv.dataset.h){ cv.dataset.h=cv.getAttribute("height")||"90"; cv.style.height=cv.dataset.h+"px"; }
+  const h=+cv.dataset.h;
   const dpr=window.devicePixelRatio||1;
-  const w=cv.clientWidth||600, h=cv.height||90;
-  cv.width=w*dpr; cv.height=h*dpr;
+  const w=cv.clientWidth||600;
+  cv.width=Math.round(w*dpr); cv.height=Math.round(h*dpr);
   const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,w,h);
   const vals=series.map(p=>p.cum);
   const mn=Math.min(0,...vals), mx=Math.max(0,...vals);
@@ -3349,6 +3362,183 @@ function drawXaCombinedEq(){
   series.forEach((p,i)=>{ const px=x(i), py=y(p.cum); i===0?ctx.moveTo(px,py):ctx.lineTo(px,py); });
   ctx.stroke();
 }
+
+// ============================================================
+// COMBINED VIEW -- N independently interactive mini price/trade charts, one per leg,
+// stacked so they can all be seen and compared at once (no tab-switching needed), plus
+// the merged combined-equity curve underneath. Deliberately a SEPARATE, self-contained
+// implementation (own state per instance via makeMiniChart(), own pan/zoom/hover) rather
+// than generalizing the singleton CH/drawPx engine used by the main panel and single-leg
+// preview above -- that engine is deeply tied to one global CH object and is what Farhan
+// depends on every day for the primary chart, so duplicating the (much smaller) feature
+// set needed here avoids any risk of regressing that code path. Scope is intentionally a
+// subset of the full chart: candles + trade entry/exit markers + pan (drag) + zoom (wheel)
+// + hover tooltip + double-click reset -- no replay/drawing-tools/indicator-overlay/VIX,
+// which aren't needed for a side-by-side comparison view.
+// ============================================================
+function makeMiniChart(canvasId, tipId){
+  const cv=$(canvasId);
+  const st={bars:null,pos:[],entryIdx:[],exitIdx:[],fills:[],a:0,b:0,i0:0,i1:0,hover:-1,label:"",hit:[]};
+  let dragX=null;
+  function xOfM(i,W){ return PADL+(i-st.a)/(st.b-st.a)*(W-PADL-PADR); }
+  function iOfM(x,W){ return Math.round(st.a+(x-PADL)/(W-PADL-PADR)*(st.b-st.a)); }
+  function clampM(){
+    const span=Math.max(20,st.b-st.a);
+    st.a=Math.max(st.i0,Math.min(st.a,st.i1-20));
+    st.b=Math.min(st.i1,st.a+span);
+    if(st.b-st.a<20) st.a=Math.max(st.i0,st.b-20);
+  }
+  function bIdx(t){ let lo=0,hi=st.bars.length-1; while(lo<hi){ const m=(lo+hi)>>1; if(st.bars[m].t<t) lo=m+1; else hi=m; } return lo; }
+  function set(leg){
+    st.bars=leg.bars; st.pos=leg.trades; st.i0=0; st.i1=leg.bars.length-1;
+    st.a=0; st.b=st.i1; st.hover=-1; st.label=leg.label;
+    st.entryIdx=st.pos.map(p=>p.entryBar);
+    st.exitIdx=st.pos.map(p=>bIdx(p.exitTime));
+    st.fills=st.pos.map(p=>p.exits.map(f=>({i:bIdx(f.t),px:f.px,qty:f.qty,lab:reasonShort(f.reason),net:f.net})));
+    draw();
+  }
+  function draw(){
+    if(!st.bars) return;
+    const [ctx,W,H]=setupCanvas(cv); ctx.clearRect(0,0,W,H);
+    const T=CANVAS_THEME();
+    const b=st.bars, a=st.a, z=st.b, n=z-a+1;
+    let mn=Infinity,mx=-Infinity;
+    const step=Math.max(1,Math.floor(n/(W*3)));
+    for(let i=a;i<=z;i+=step){ if(b[i].l<mn)mn=b[i].l; if(b[i].h>mx)mx=b[i].h; }
+    if(!isFinite(mn)) return; const pad=(mx-mn)*0.05||1; mn-=pad; mx+=pad;
+    const y=v=>8+(1-(v-mn)/(mx-mn))*(H-24);
+    ctx.font="10px sans-serif"; ctx.textAlign="left";
+    for(const v of niceTicks(mn,mx,4)){ const yy=y(v);
+      ctx.strokeStyle="#232a3d"; ctx.beginPath();ctx.moveTo(PADL,yy);ctx.lineTo(W-PADR,yy);ctx.stroke();
+      ctx.fillStyle=T.dim; ctx.fillText(v.toLocaleString(undefined,{maximumFractionDigits:0}),4,yy+3); }
+    ctx.textAlign="center";
+    for(let g=0;g<=5;g++){ const i=Math.round(a+(z-a)*g/5); const xx=xOfM(i,W);
+      ctx.fillText(tipFmt.format(new Date(b[i].t)).replace(",",""),Math.max(PADL+28,Math.min(W-40,xx)),H-4); }
+    const pxPerBar=(W-PADL-PADR)/n;
+    if(pxPerBar>=2.5){
+      const cw=Math.max(1,pxPerBar*0.65);
+      for(let i=a;i<=z;i++){ const xx=xOfM(i,W); const up=b[i].c>=b[i].o;
+        ctx.strokeStyle=ctx.fillStyle=up?T.green:T.red;
+        ctx.beginPath();ctx.moveTo(xx,y(b[i].h));ctx.lineTo(xx,y(b[i].l));ctx.stroke();
+        const y1=y(Math.max(b[i].o,b[i].c)), y2=y(Math.min(b[i].o,b[i].c));
+        ctx.fillRect(xx-cw/2,y1,cw,Math.max(1,y2-y1)); }
+    } else {
+      ctx.strokeStyle=T.text; ctx.lineWidth=1; ctx.beginPath();
+      let first=true;
+      for(let i=a;i<=z;i+=step){ const xx=xOfM(i,W),yy=y(b[i].c); first?ctx.moveTo(xx,yy):ctx.lineTo(xx,yy); first=false; }
+      ctx.stroke();
+    }
+    const showLabels = pxPerBar>=3 || st.pos.length<=15;
+    st.hit=[];
+    ctx.font="10px sans-serif";
+    for(let k=0;k<st.pos.length;k++){
+      const eI=st.entryIdx[k], xI=st.exitIdx[k];
+      if(xI<a||eI>z) continue;
+      const p=st.pos[k];
+      const ex=xOfM(Math.max(a,Math.min(z,eI)),W), eyy=y(p.avg);
+      for(const f of st.fills[k]){
+        if(f.i<a-2||f.i>z+2) continue;
+        const fx=xOfM(Math.max(a,Math.min(z,f.i)),W), fy=y(f.px);
+        ctx.strokeStyle=f.net>=0?"rgba(38,166,154,.5)":"rgba(239,83,80,.5)";
+        ctx.setLineDash([3,3]); ctx.beginPath();ctx.moveTo(ex,eyy);ctx.lineTo(fx,fy);ctx.stroke(); ctx.setLineDash([]);
+      }
+      if(eI>=a&&eI<=z){
+        st.hit.push({x:ex,y:eyy,k});
+        ctx.fillStyle=p.dir===1?T.green:T.red;
+        ctx.beginPath();
+        if(p.dir===1){ ctx.moveTo(ex,eyy+4);ctx.lineTo(ex-5,eyy+12);ctx.lineTo(ex+5,eyy+12); }
+        else { ctx.moveTo(ex,eyy-4);ctx.lineTo(ex-5,eyy-12);ctx.lineTo(ex+5,eyy-12); }
+        ctx.closePath();ctx.fill();
+        if(showLabels){
+          ctx.textAlign="center";
+          const ly=p.dir===1?eyy+23:eyy-16;
+          const txt=(p.dir===1?"LONG ":"SHORT ")+p.qty+"x @ "+p.avg.toFixed(2);
+          const tw=ctx.measureText(txt).width;
+          ctx.fillStyle="#0f1117cc"; ctx.fillRect(ex-tw/2-3,ly-9,tw+6,12);
+          ctx.fillStyle=p.dir===1?T.green:T.red; ctx.fillText(txt,ex,ly);
+        }
+      }
+      for(const f of st.fills[k]){
+        if(f.i<a||f.i>z) continue;
+        const fx=xOfM(f.i,W), fy=y(f.px);
+        st.hit.push({x:fx,y:fy,k});
+        ctx.fillStyle=f.net>=0?T.green:T.red;
+        ctx.beginPath();ctx.arc(fx,fy,3.2,0,7);ctx.fill();
+        ctx.strokeStyle="#0f1117"; ctx.stroke();
+      }
+    }
+    if(st.hover>=a&&st.hover<=z){
+      const xx=xOfM(st.hover,W);
+      ctx.strokeStyle="rgba(215,220,232,.35)"; ctx.setLineDash([3,3]);
+      ctx.beginPath();ctx.moveTo(xx,8);ctx.lineTo(xx,H-20);ctx.stroke(); ctx.setLineDash([]);
+    }
+    ctx.textAlign="left"; ctx.fillStyle=T.text; ctx.font="bold 11px sans-serif";
+    ctx.fillText(st.label, PADL, 14);
+  }
+  function showTipM(e){
+    const tip=$(tipId); const i=st.hover, b=st.bars;
+    if(i<0||!b||!b[i]){ tip.style.display="none"; return; }
+    let html="<b>"+st.label+"</b><br>"+tipFmt.format(new Date(b[i].t))+" PT<br>O "+b[i].o.toFixed(2)+" &nbsp;H "+b[i].h.toFixed(2)+"<br>L "+b[i].l.toFixed(2)+" &nbsp;C "+b[i].c.toFixed(2);
+    const cvr=cv.getBoundingClientRect();
+    const mx=e.clientX-cvr.left, my=e.clientY-cvr.top;
+    let bestK=-1, bestD=18;
+    for(const h of st.hit){ const d=Math.hypot(h.x-mx,h.y-my); if(d<bestD){bestD=d;bestK=h.k;} }
+    if(bestK>=0){
+      const p=st.pos[bestK];
+      html+="<br><span style='color:var(--amber)'>"+p.mode+" — "+(p.dir===1?"LONG":"SHORT")+" "+p.qty+"x @ "+p.avg.toFixed(2)+"</span>";
+      for(const f of st.fills[bestK]) html+="<br><span class='"+(f.net>=0?"pos":"neg")+"'>&nbsp;&nbsp;"+f.qty+"x out @ "+f.px.toFixed(2)+" ("+f.lab+") "+(f.net>=0?"+":"")+f.net.toFixed(0)+"$</span>";
+      html+="<br>total <span class='"+(p.pnl>=0?"pos":"neg")+"'>"+(p.pnl>=0?"+":"")+fmt$(p.pnl)+"</span>";
+    }
+    tip.innerHTML=html;
+    const wrap=cv.parentElement.getBoundingClientRect();
+    let tx=e.clientX-wrap.left+14, ty=e.clientY-wrap.top+10;
+    tip.style.display="block";
+    if(tx+170>wrap.width) tx-=190;
+    tip.style.left=tx+"px"; tip.style.top=Math.max(0,Math.min(ty,wrap.height-90))+"px";
+  }
+  cv.addEventListener("pointerdown",e=>{ dragX=e.clientX; cv.setPointerCapture(e.pointerId); cv.style.cursor="grabbing"; });
+  cv.addEventListener("pointerup",()=>{ dragX=null; cv.style.cursor="grab"; });
+  cv.addEventListener("pointermove",e=>{
+    const r=cv.getBoundingClientRect(); const W=r.width;
+    if(dragX!=null){
+      const dBars=Math.round((dragX-e.clientX)/((W-PADL-PADR)/(st.b-st.a)));
+      if(dBars!==0){ dragX=e.clientX;
+        const span=st.b-st.a;
+        st.a=Math.max(st.i0,Math.min(st.a+dBars,st.i1-span));
+        st.b=st.a+span; draw(); }
+    } else {
+      st.hover=Math.max(st.a,Math.min(st.b,iOfM(e.clientX-r.left,W)));
+      showTipM(e); draw();
+    }
+  });
+  cv.addEventListener("pointerleave",()=>{ st.hover=-1; $(tipId).style.display="none"; draw(); });
+  cv.addEventListener("wheel",e=>{
+    e.preventDefault();
+    const r=cv.getBoundingClientRect(); const W=r.width;
+    const center=iOfM(e.clientX-r.left,W);
+    const f=e.deltaY>0?1.25:0.8;
+    let span=Math.round((st.b-st.a)*f);
+    span=Math.max(20,Math.min(span,st.i1-st.i0));
+    const frac=(center-st.a)/(st.b-st.a||1);
+    st.a=Math.round(center-frac*span); st.b=st.a+span; clampM(); draw();
+  },{passive:false});
+  cv.addEventListener("dblclick",()=>{ st.a=st.i0; st.b=st.i1; draw(); });
+  return {set, draw};
+}
+let XA_MINI_CHARTS=[];
+function renderXaCombinedView(){
+  if(!XA_LAST || !XA_COMBINED) return;
+  const host=$("xaCombinedCharts");
+  host.innerHTML=XA_LAST.map((l,i)=>
+    "<div style='position:relative;margin-bottom:12px'>"+
+      "<canvas id='xaMini_"+i+"' height='220' style='width:100%;cursor:grab' title='drag to pan, scroll to zoom, dblclick to reset'></canvas>"+
+      "<div id='xaMiniTip_"+i+"' style='position:absolute;display:none;pointer-events:none;background:#0b0e16f0;border:1px solid var(--border);border-radius:6px;padding:6px 9px;font-size:11px;line-height:1.5;z-index:5;white-space:nowrap'></div>"+
+    "</div>").join("");
+  XA_MINI_CHARTS=XA_LAST.map((l,i)=>{ const c=makeMiniChart("xaMini_"+i,"xaMiniTip_"+i); c.set(l); return c; });
+  $("xaCombinedSummary").innerHTML="Combined (all "+XA_LAST.length+" legs) · net <b class='"+(XA_COMBINED.net>=0?'pos':'neg')+"'>"+fmt$(XA_COMBINED.net)+"</b> · max DD <b>"+fmt$(XA_COMBINED.maxDD)+"</b> — each chart below is its own leg's real price/trades, fully pannable/zoomable, shown together for comparison.";
+  drawXaCombinedEq("xaCombinedEqChartBig");
+}
+
 // ---- leg results panel: a dedicated modal overlay, not the main page in place. Opening it
 // physically MOVES the real statsHost/chartCard/engine+month grid/trades card DOM nodes into
 // the modal (an anchor comment node marks exactly where they came from) so the actual live
@@ -3358,7 +3548,7 @@ function drawXaCombinedEq(){
 // main panel's own real run, so the primary results are never actually lost or stale.
 let XA_MODAL_ANCHOR=null;
 function xaOpenModal(){
-  if(XA_MODAL_ANCHOR) return; // already open
+  if(XA_MODAL_ANCHOR){ return; } // already open -- just switching which sub-view shows
   const mount=$("xaLegModalMount");
   const statsHost=$("statsHost"), chartCard=$("chartCard"), grid=$("engineMonthGrid"), tradesCard=$("tradesCard");
   const anchor=document.createComment("xa-modal-anchor");
@@ -3380,6 +3570,8 @@ function xaCloseModal(){
   parent.removeChild(anchor);
   XA_MODAL_ANCHOR=null;
   $("xaLegModalOverlay").style.display="none";
+  $("xaCombinedPanel").style.display="none";
+  $("xaLegModalMount").style.display="";
   document.removeEventListener("keydown", xaModalEscHandler);
   XA_VIEWING=null;
   if(LAST) renderResults(LAST.res, LAST.sim, LAST.bars, LAST.iStart, LAST.iEnd, LAST.ms||0);
@@ -3392,6 +3584,8 @@ $("xaLegModalOverlay").addEventListener("click",e=>{ if(e.target.id==="xaLegModa
 function renderLegPreview(idx){
   const leg=XA_LAST&&XA_LAST[idx]; if(!leg) return;
   xaOpenModal();
+  $("xaCombinedPanel").style.display="none";
+  $("xaLegModalMount").style.display="";
   const bars=leg.bars, res=leg.res, sim=leg.sim, iStart=0, iEnd=bars.length-1;
   const st=computeStats(res,sim,bars,iStart,iEnd);
   renderStatTiles(st,sim);
@@ -3408,11 +3602,20 @@ function renderLegPreview(idx){
   XA_VIEWING=idx;
   updateXaTabsUI();
 }
+function showXaCombinedView(){
+  if(!XA_LAST || !XA_COMBINED){ return; }
+  xaOpenModal();
+  $("xaLegModalMount").style.display="none";
+  $("xaCombinedPanel").style.display="block";
+  renderXaCombinedView();
+  XA_VIEWING="combined";
+  updateXaTabsUI();
+}
 function restoreMainView(){ xaCloseModal(); }
 function updateXaTabsUI(){
   document.querySelectorAll(".xaTabBtn").forEach(btn=>{
     const isCombined=btn.dataset.legidx==="combined";
-    const active=!isCombined && XA_VIEWING===+btn.dataset.legidx;
+    const active = isCombined ? XA_VIEWING==="combined" : XA_VIEWING===+btn.dataset.legidx;
     btn.style.background=active?"var(--accent)":"";
     btn.style.color=active?"#fff":"";
   });
@@ -3420,7 +3623,7 @@ function updateXaTabsUI(){
 document.body.addEventListener("click",e=>{
   const btn=e.target.closest(".xaTabBtn"); if(!btn) return;
   const v=btn.dataset.legidx;
-  if(v==="combined"){ if(XA_MODAL_ANCHOR) xaCloseModal(); $("xaResults").scrollIntoView({behavior:"smooth", block:"center"}); return; }
+  if(v==="combined"){ showXaCombinedView(); return; }
   renderLegPreview(+v);
 });
 // extra per-leg metrics, driven by the SAME customizable registry as the main tile grid --
