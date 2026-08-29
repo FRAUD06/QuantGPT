@@ -438,6 +438,15 @@ body.focusMode #main{padding:8px}
     <button id="metricsSave" style="width:100%;margin-top:10px">Save</button>
   </div>
 </div>
+<div id="xaLegModalOverlay" class="modalOverlay" style="display:none">
+  <div class="modalCard" id="xaLegModalCard" style="width:min(1200px,96vw);max-height:94vh;overflow-y:auto;text-align:left">
+    <div class="flex" style="justify-content:space-between;align-items:center;margin-bottom:10px;gap:10px">
+      <div id="xaLegModalTabs" style="display:flex;flex-wrap:wrap;gap:6px"></div>
+      <button class="small ghost" id="xaLegModalClose" style="flex-shrink:0">&times; Close</button>
+    </div>
+    <div id="xaLegModalMount"></div>
+  </div>
+</div>
 <div id="sidebar">
   <div class="flex" style="justify-content:space-between;align-items:flex-start">
     <div>
@@ -775,7 +784,7 @@ body.focusMode #main{padding:8px}
       <canvas id="vixChart" height="100" style="cursor:grab;touch-action:none"></canvas>
     </div>
   </div>
-  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px" id="engineMonthGrid">
     <div class="card">
       <h2>Engine attribution</h2>
       <div class="tablewrap" style="max-height:260px"><table id="engineTable"></table></div>
@@ -785,7 +794,7 @@ body.focusMode #main{padding:8px}
       <div class="tablewrap" style="max-height:260px"><table class="monthgrid" id="monthTable"></table></div>
     </div>
   </div>
-  <div class="card">
+  <div class="card" id="tradesCard">
     <div class="flex" style="justify-content:space-between;margin-bottom:8px">
       <h2 style="margin:0">Trades <span id="tradeCount" style="text-transform:none;font-weight:400"></span></h2>
       <button class="small ghost" id="btnExportTrades" disabled>Export trades CSV</button>
@@ -3236,10 +3245,10 @@ async function runCrossAssetTest(){
   if(!$("xaEnabled").checked){ host.innerHTML=""; status.textContent=""; return; }
   if(!LAST || !DATA){ status.innerHTML='<span class="neg">Run the main backtest first.</span>'; return; }
   status.textContent="Running combined test…"; host.innerHTML="";
-  // a fresh run invalidates any previous leg-preview index -- if the user was mid-preview,
-  // snap the main panel back to its own real results rather than leaving stale leg data on
-  // screen with the "back to main" button now hidden (no way back otherwise)
-  if(XA_VIEWING!==null) restoreMainView();
+  // a fresh run invalidates any previous leg-preview index -- if the leg panel was open,
+  // close it (which restores the main panel's own real results) rather than leaving stale
+  // leg data sitting behind it
+  if(XA_VIEWING!==null) xaCloseModal();
   try{
     const legs=[{symbol:currentSymbol(), group:ASSET_GROUP[currentSymbol()]||currentSymbol(), bars:LAST.bars, sim:LAST.sim, trades:LAST.res.broker.positions, res:LAST.res, label:currentSymbol()+" ("+DATA.interval+")"}];
     const leg2=await runLeg($("xa2Symbol").value, +$("xa2Tf").value, $("xa2Strat").value, +$("xa2Pv").value, +$("xa2Tick").value);
@@ -3283,11 +3292,11 @@ async function runCrossAssetTest(){
       ? (anyBlocked ? "<div style='margin-top:8px;padding:7px 9px;border-radius:6px;font-size:11.5px;background:#2a2a1a;border:1px solid #5c5c1e;color:#e8d87f'>Hedge blocking is ON and excluded "+blocked.reduce((s,l)=>s+l.blockedCount,0)+" opposite-direction, same-group entr"+(blocked.reduce((s,l)=>s+l.blockedCount,0)===1?"y":"ies")+" from the combined calc (first-open leg kept priority).</div>"
                     : "<div style='margin-top:8px;font-size:11px;color:var(--dim)'>Hedge blocking is ON, but no same-group opposite-direction overlaps occurred -- nothing was excluded.</div>")
       : "<div style='margin-top:8px;font-size:11px;color:var(--dim)'>Hedge blocking is OFF -- combined result assumes the account allows simultaneous opposite-direction positions across legs.</div>";
-    const tabsHtml="<div id='xaLegTabs' style='display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px'>"+
-      legs.map((l,i)=>"<button class='small ghost xaTabBtn' data-legidx='"+i+"'>"+l.label+"</button>").join("")+
-      "<button class='small ghost xaTabBtn' data-legidx='combined'>Combined (equity)</button>"+
-      "</div>"+
-      "<div style='font-size:10.5px;color:var(--dim);margin-bottom:8px'>Click a leg to load its full interactive results (chart, trades, stat tiles) into the main panel below -- same view as your primary run, just pointed at that leg.</div>";
+    const xaTabsInner=legs.map((l,i)=>"<button class='small ghost xaTabBtn' data-legidx='"+i+"'>"+l.label+"</button>").join("")+
+      "<button class='small ghost xaTabBtn' data-legidx='combined'>Combined (equity)</button>";
+    const tabsHtml="<div id='xaLegTabs' style='display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px'>"+xaTabsInner+"</div>"+
+      "<div style='font-size:10.5px;color:var(--dim);margin-bottom:8px'>Click a leg to open its full interactive results (chart, trades, stat tiles) in its own panel, pointed at that leg's own run.</div>";
+    $("xaLegModalTabs").innerHTML=xaTabsInner;
     host.innerHTML=tabsHtml+table+corrRows+hedgeNote+
       "<div style='font-size:10.5px;color:var(--dim);margin-top:6px'>Combined DD is close-based/daily (trades booked to their exit date, summed across legs, re-drawn-down) -- not tick-level intrabar alignment across instruments. Each leg runs its strategy's own default params.</div>"+
       "<div id='xaMetricsRows' style='margin-top:8px'></div>"+
@@ -3302,6 +3311,20 @@ async function runCrossAssetTest(){
     status.innerHTML='<span class="neg">'+e.message+'</span>'; host.innerHTML=""; XA_LAST=null; XA_COMBINED=null;
   }
 }
+// keep each leg's point value / min tick in sync with its own symbol dropdown, same as the
+// main panel's loadAsset() already does for the primary symbol -- previously these were bare
+// number inputs the user had to update by hand after switching a leg's asset.
+function syncLegAssetFields(symbolId, pvId, tickId){
+  const meta = ASSET_META[$(symbolId).value];
+  if(!meta) return;
+  $(pvId).value = meta.pointValue;
+  $(tickId).value = meta.minTick;
+}
+$("xa2Symbol").addEventListener("change", ()=>syncLegAssetFields("xa2Symbol","xa2Pv","xa2Tick"));
+$("xa3Symbol").addEventListener("change", ()=>syncLegAssetFields("xa3Symbol","xa3Pv","xa3Tick"));
+// (initial sync for whatever symbols are pre-selected happens after ASSET_META is defined
+// further down this script -- see the call next to the initial loadAsset() bootstrap)
+
 $("xaRun").onclick=runCrossAssetTest;
 
 // ---- per-leg full-results preview: reuses the SAME main-panel chart/tiles/tables,
@@ -3326,56 +3349,78 @@ function drawXaCombinedEq(){
   series.forEach((p,i)=>{ const px=x(i), py=y(p.cum); i===0?ctx.moveTo(px,py):ctx.lineTo(px,py); });
   ctx.stroke();
 }
+// ---- leg results panel: a dedicated modal overlay, not the main page in place. Opening it
+// physically MOVES the real statsHost/chartCard/engine+month grid/trades card DOM nodes into
+// the modal (an anchor comment node marks exactly where they came from) so the actual live
+// chart/canvas/trade-table code (chartSet, renderTradeTable, etc.) runs completely unchanged
+// -- it's the same interactive chart, drawing tools, bar replay and all, just relocated.
+// Closing the modal moves those same nodes back to their original spot and re-renders the
+// main panel's own real run, so the primary results are never actually lost or stale.
+let XA_MODAL_ANCHOR=null;
+function xaOpenModal(){
+  if(XA_MODAL_ANCHOR) return; // already open
+  const mount=$("xaLegModalMount");
+  const statsHost=$("statsHost"), chartCard=$("chartCard"), grid=$("engineMonthGrid"), tradesCard=$("tradesCard");
+  const anchor=document.createComment("xa-modal-anchor");
+  statsHost.parentNode.insertBefore(anchor, statsHost);
+  mount.appendChild(statsHost); mount.appendChild(chartCard); mount.appendChild(grid); mount.appendChild(tradesCard);
+  XA_MODAL_ANCHOR=anchor;
+  $("xaLegModalOverlay").style.display="flex";
+  document.addEventListener("keydown", xaModalEscHandler);
+}
+function xaModalEscHandler(e){ if(e.key==="Escape") xaCloseModal(); }
+function xaCloseModal(){
+  if(!XA_MODAL_ANCHOR) return;
+  const anchor=XA_MODAL_ANCHOR, parent=anchor.parentNode;
+  const statsHost=$("statsHost"), chartCard=$("chartCard"), grid=$("engineMonthGrid"), tradesCard=$("tradesCard");
+  parent.insertBefore(statsHost, anchor);
+  parent.insertBefore(chartCard, anchor);
+  parent.insertBefore(grid, anchor);
+  parent.insertBefore(tradesCard, anchor);
+  parent.removeChild(anchor);
+  XA_MODAL_ANCHOR=null;
+  $("xaLegModalOverlay").style.display="none";
+  document.removeEventListener("keydown", xaModalEscHandler);
+  XA_VIEWING=null;
+  if(LAST) renderResults(LAST.res, LAST.sim, LAST.bars, LAST.iStart, LAST.iEnd, LAST.ms||0);
+  updateXaTabsUI();
+  if(CH.bars) requestDraw();
+}
+$("xaLegModalClose").onclick=xaCloseModal;
+$("xaLegModalOverlay").addEventListener("click",e=>{ if(e.target.id==="xaLegModalOverlay") xaCloseModal(); });
+
 function renderLegPreview(idx){
   const leg=XA_LAST&&XA_LAST[idx]; if(!leg) return;
+  xaOpenModal();
   const bars=leg.bars, res=leg.res, sim=leg.sim, iStart=0, iEnd=bars.length-1;
   const st=computeStats(res,sim,bars,iStart,iEnd);
   renderStatTiles(st,sim);
   $("indicatorNote").style.display=(st.pos.length===0 && res.dr && (res.dr.boxes.length+res.dr.lines.length+res.dr.labels.length)>0) ? "block" : "none";
-  $("eqInfo").textContent="· previewing "+leg.label+" · "+(iEnd-iStart+1).toLocaleString()+" bars · "+st.days.toFixed(0)+" days";
+  $("eqInfo").textContent="· "+leg.label+" · "+(iEnd-iStart+1).toLocaleString()+" bars · "+st.days.toFixed(0)+" days";
   chartSet(bars,res.equity,iStart,iEnd,sim,st.pos,res.dr||null,res.plt||null,res.plotMeta||[],res.overlay!==false);
   renderEngineTable(st.pos);
   renderMonthTable(st.pos, bars, res.equity, iStart, iEnd, res.equityBest, res.equityWorst);
   renderTradeTable(st.pos);
   $("btnExportTrades").disabled=st.pos.length===0;
   renderDDFrequency(res,sim,bars,iStart,iEnd,st.days);
-  $("discValResults").innerHTML="<div style='font-size:11px;color:var(--dim)'>Discovery/validation split reflects the main panel's own run, not this leg preview. Click ← Back to main results to restore it.</div>";
+  $("discValResults").innerHTML="<div style='font-size:11px;color:var(--dim)'>Discovery/validation split reflects the main panel's own run, not this leg. Close this panel to get back to it.</div>";
   $("discValStatus").textContent="";
   XA_VIEWING=idx;
   updateXaTabsUI();
-  $("chartCard").scrollIntoView({behavior:"smooth", block:"start"});
 }
-function restoreMainView(){
-  if(!LAST) return;
-  XA_VIEWING=null;
-  renderResults(LAST.res, LAST.sim, LAST.bars, LAST.iStart, LAST.iEnd, LAST.ms||0);
-  updateXaTabsUI();
-}
+function restoreMainView(){ xaCloseModal(); }
 function updateXaTabsUI(){
-  const bar=$("xaLegTabs"); if(!bar) return;
-  bar.querySelectorAll(".xaTabBtn").forEach(btn=>{
+  document.querySelectorAll(".xaTabBtn").forEach(btn=>{
     const isCombined=btn.dataset.legidx==="combined";
     const active=!isCombined && XA_VIEWING===+btn.dataset.legidx;
     btn.style.background=active?"var(--accent)":"";
     btn.style.color=active?"#fff":"";
   });
-  let backBtn=$("xaBackToMain");
-  if(XA_VIEWING!==null){
-    if(!backBtn){
-      backBtn=document.createElement("button");
-      backBtn.id="xaBackToMain"; backBtn.className="small ghost";
-      backBtn.textContent="← Back to main results";
-      backBtn.style.marginBottom="8px";
-      $("chartCard").parentNode.insertBefore(backBtn, $("chartCard"));
-      backBtn.onclick=restoreMainView;
-    }
-    backBtn.style.display="";
-  } else if(backBtn){ backBtn.style.display="none"; }
 }
 document.body.addEventListener("click",e=>{
   const btn=e.target.closest(".xaTabBtn"); if(!btn) return;
   const v=btn.dataset.legidx;
-  if(v==="combined"){ $("xaResults").scrollIntoView({behavior:"smooth", block:"center"}); return; }
+  if(v==="combined"){ if(XA_MODAL_ANCHOR) xaCloseModal(); $("xaResults").scrollIntoView({behavior:"smooth", block:"center"}); return; }
   renderLegPreview(+v);
 });
 // extra per-leg metrics, driven by the SAME customizable registry as the main tile grid --
@@ -4998,6 +5043,8 @@ restorePineDraft();
 fetchCsv("data/gex.csv").then(loadEmbeddedGex).catch(e=>console.warn("GEX load failed", e));
 fetchCsv("data/vix.csv").then(loadEmbeddedVix).catch(e=>console.warn("VIX load failed", e));
 loadAsset(currentSymbol(), currentTfMin());
+syncLegAssetFields("xa2Symbol","xa2Pv","xa2Tick");
+syncLegAssetFields("xa3Symbol","xa3Pv","xa3Tick");
 window.addEventListener("resize",()=>{ if(CH.bars) requestDraw(); });
 
 /* ============================================================
